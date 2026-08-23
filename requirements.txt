@@ -1,0 +1,21 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+python-multipart==0.0.9
+pydantic==2.9.2
+pypdf==5.0.1
+pymupdf==1.28.2
+pyjwt==2.13.0
+passlib==1.7.4
+# Pinned below 4.1: passlib 1.7.4's bcrypt self-test crashes against
+# bcrypt>=4.1 (a known upstream incompatibility -- passlib hasn't shipped a
+# fix on PyPI). Revisit this pin if passlib is ever upgraded.
+bcrypt==4.0.1
+pytesseract==0.3.13
+Pillow==12.3.0
+# pytesseract is only a Python wrapper -- it calls out to the Tesseract OCR
+# *binary*, which is a SEPARATE, OS-level dependency this list can't
+# install. Without it, any OCR call raises TesseractNotFoundError at
+# runtime. Required on every deployment target:
+#   Debian/Ubuntu:  apt-get install -y tesseract-ocr
+#   Windows (local dev): winget install --id UB-Mannheim.TesseractOCR -e
+# See app/services/ocr_extraction.py and the README for more.

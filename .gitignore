@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Generated export artifacts (CSVs/zips) -- runtime output, not source.
+# See app/core/config.py EXPORT_STORAGE_ROOT.
+storage/

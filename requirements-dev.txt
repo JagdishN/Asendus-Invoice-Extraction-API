@@ -1,0 +1,6 @@
+# Dev/test-only dependencies -- not needed to run the app itself.
+-r requirements.txt
+
+pytest==9.1.1
+httpx==0.28.1      # required by FastAPI's TestClient
+reportlab==5.0.0   # generates synthetic born-digital PDFs for extraction tests
