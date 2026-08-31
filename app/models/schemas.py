@@ -63,12 +63,23 @@ class SplitValueInput(BaseModel):
 class InvoiceLineItem(BaseModel):
     line_number: int
     item_description: str
+    # Packing reference split off item_description's own trailing " -<pack>"
+    # segment (e.g. "Nefrosave Forte Tablets -15s" -> description
+    # "Nefrosave Forte Tablets", pack "15s") -- see
+    # native_pdf_extraction.py's _split_description_and_pack. Client-
+    # confirmed: this is packaging info (tablet count, volume), not part
+    # of the product name proper.
+    pack: Optional[str] = None
     hsn_sac: Optional[str] = None
     # Pharma-format fields (see native_pdf_extraction.py's pharma column
     # mapping). batch_number/expiry_date are regulatory-required for
     # pharma distribution, not present on the earlier generic invoice format.
     batch_number: Optional[str] = None
     expiry_date: Optional[str] = None
+    # Manufacture date -- some formats print this alongside batch/expiry
+    # on the line item (e.g. "BATCH NO:X EXP DT : Y MFG DT : Z"); see
+    # native_pdf_extraction.py's batch-detail-row format.
+    mfg_date: Optional[str] = None
     quantity: Optional[float] = None  # generic quantity, used by non-pharma formats
     # Confirmed with client: Sold and Free quantities for the same product
     # are kept as SEPARATE line items (separate rows, as printed), not

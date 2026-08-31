@@ -1,3 +1,4 @@
+import csv
 import io
 import uuid
 import zipfile
@@ -123,6 +124,77 @@ def test_export_is_generated_once_and_reused_on_subsequent_calls(client):
 
     assert first.content == second.content
     assert detail_after_second["export"]["generated_at"] == generated_at_first
+
+
+def test_export_columns_endpoint_lists_field_names_and_labels(client):
+    resp = client.get("/api/jobs/export/columns")
+    assert resp.status_code == 200
+    columns = resp.json()["columns"]
+
+    field_names = [c["field_name"] for c in columns]
+    assert "item_description" in field_names
+    assert "pack" in field_names
+    labels = {c["field_name"]: c["label"] for c in columns}
+    assert labels["item_description"] == "Item Description"
+    assert labels["pack"] == "Pack"
+
+
+def test_export_with_columns_param_returns_only_selected_line_item_columns(client):
+    job_id = _upload_single_invoice_job(client)
+    resp = client.get(f"/api/jobs/{job_id}/export?columns=line_number,item_description")
+
+    assert resp.status_code == 200
+    content = resp.content.decode("utf-8-sig")
+    rows = list(csv.reader(content.splitlines()))
+    blank_row_index = next(i for i, row in enumerate(rows) if row == [])
+    assert rows[blank_row_index + 1] == ["Line #", "Item Description"]
+
+
+def test_export_with_columns_param_is_not_cached_as_the_default_export(client):
+    # A column-filtered download must never overwrite/be served back as
+    # the job's stable "every column" default export.
+    job_id = _upload_single_invoice_job(client)
+    filtered = client.get(f"/api/jobs/{job_id}/export?columns=item_description")
+    default = client.get(f"/api/jobs/{job_id}/export")
+
+    assert filtered.status_code == default.status_code == 200
+    filtered_rows = filtered.content.decode("utf-8-sig").splitlines()
+    default_rows = default.content.decode("utf-8-sig").splitlines()
+    assert len(filtered_rows) == len(default_rows)  # same number of items
+    assert filtered.content != default.content  # but not the same columns
+
+
+def test_export_with_unknown_columns_falls_back_to_every_column(client):
+    job_id = _upload_single_invoice_job(client)
+    resp = client.get(f"/api/jobs/{job_id}/export?columns=not_a_real_field")
+    default = client.get(f"/api/jobs/{job_id}/export")
+    assert resp.content == default.content
+
+
+def test_export_zip_with_columns_param_filters_every_csv_in_the_zip(client):
+    job_id = _upload_multi_invoice_job(client, ["INV/2026/050", "INV/2026/051"])
+    resp = client.get(f"/api/jobs/{job_id}/export/zip?columns=line_number,item_description")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        assert len(zf.namelist()) == 2
+        for name in zf.namelist():
+            content = zf.read(name).decode("utf-8-sig")
+            rows = list(csv.reader(content.splitlines()))
+            blank_row_index = next(i for i, row in enumerate(rows) if row == [])
+            assert rows[blank_row_index + 1] == ["Line #", "Item Description"]
+
+
+def test_export_single_invoice_by_number_with_columns_param(client):
+    job_id = _upload_multi_invoice_job(client, ["INV/2026/060", "INV/2026/061"])
+    resp = client.get(f"/api/jobs/{job_id}/export/INV/2026/060?columns=item_description")
+
+    assert resp.status_code == 200
+    content = resp.content.decode("utf-8-sig")
+    rows = list(csv.reader(content.splitlines()))
+    blank_row_index = next(i for i, row in enumerate(rows) if row == [])
+    assert rows[blank_row_index + 1] == ["Item Description"]
 
 
 def test_debug_populate_dummy_data_endpoint_adds_groups_and_clears_stale_export(client):

@@ -29,7 +29,7 @@ from app.models.schemas import (
     JobStatus,
 )
 from app.services.export_storage import export_storage
-from app.services.filename_safety import resolve_unique_filenames
+from app.services.filename_safety import resolve_unique_filenames, sanitize_filename
 
 CSV_MEDIA_TYPE = "text/csv"
 ZIP_MEDIA_TYPE = "application/zip"
@@ -41,9 +41,11 @@ _EXCLUDED_LINE_ITEM_FIELDS = {"field_confidences"}
 _LINE_ITEM_COLUMN_LABELS = {
     "line_number": "Line #",
     "item_description": "Item Description",
+    "pack": "Pack",
     "hsn_sac": "HSN/SAC",
     "batch_number": "Batch Number",
     "expiry_date": "Expiry Date",
+    "mfg_date": "Mfg Date",
     "quantity": "Quantity",
     "quantity_sold": "Qty Sold",
     "quantity_free": "Qty Free",
@@ -70,8 +72,43 @@ _LINE_ITEM_FIELDS = [
     name for name in InvoiceLineItem.model_fields if name not in _EXCLUDED_LINE_ITEM_FIELDS
 ]
 
+# The exportable line-item column list a client-facing "choose which
+# columns to export" dropdown renders from -- field_name is what the
+# export routes' `columns` query param expects back; label is the
+# display text. Order matches the CSV's own column order. Derived
+# entirely from _LINE_ITEM_FIELDS/_LINE_ITEM_COLUMN_LABELS so it can't
+# drift out of sync with what actually gets written.
+LINE_ITEM_EXPORT_COLUMNS = [
+    {"field_name": f, "label": _LINE_ITEM_COLUMN_LABELS.get(f, f.replace("_", " ").title())}
+    for f in _LINE_ITEM_FIELDS
+]
 
-def _build_invoice_csv_bytes(group: InvoiceGroup) -> bytes:
+
+def resolve_selected_line_item_fields(columns: list[str] | None) -> list[str] | None:
+    """
+    Validates/filters a caller-supplied list of line-item field names
+    against the real set (_LINE_ITEM_FIELDS), preserving the CANONICAL
+    column order regardless of what order the caller sent them in -- so a
+    CSV's column order stays predictable no matter how a frontend
+    multi-select happens to serialize its selection.
+
+    Returns None (meaning "no filter -- use every column") when `columns`
+    is None/empty, OR when none of the given names matched a real field
+    (a safe fallback for a malformed/stale request rather than exporting
+    zero columns). A partial match filters down to just the recognized
+    subset, in canonical order -- deliberately not an all-or-nothing
+    validation, since dropping one unrecognized name shouldn't blank the
+    rest of a deliberate selection.
+    """
+    if not columns:
+        return None
+    selected = set(columns)
+    resolved = [f for f in _LINE_ITEM_FIELDS if f in selected]
+    return resolved or None
+
+
+def _build_invoice_csv_bytes(group: InvoiceGroup, selected_fields: list[str] | None = None) -> bytes:
+    fields = selected_fields if selected_fields is not None else _LINE_ITEM_FIELDS
     buffer = io.StringIO()
     writer = csv.writer(buffer)
 
@@ -97,11 +134,9 @@ def _build_invoice_csv_bytes(group: InvoiceGroup) -> bytes:
 
     writer.writerow([])  # blank separator row before the line-items table
 
-    writer.writerow(
-        [_LINE_ITEM_COLUMN_LABELS.get(f, f.replace("_", " ").title()) for f in _LINE_ITEM_FIELDS]
-    )
+    writer.writerow([_LINE_ITEM_COLUMN_LABELS.get(f, f.replace("_", " ").title()) for f in fields])
     for item in group.line_items:
-        writer.writerow([getattr(item, field_name) for field_name in _LINE_ITEM_FIELDS])
+        writer.writerow([getattr(item, field_name) for field_name in fields])
 
     # utf-8-sig (BOM) so Excel/Windows correctly detect UTF-8 when a user
     # just double-clicks a downloaded CSV instead of importing it explicitly.
@@ -177,6 +212,53 @@ def generate_and_persist_exports(job: Job) -> JobExportMetadata:
         )
 
     return JobExportMetadata(invoice_files=invoice_files, zip_file=zip_file, generated_at=generated_at)
+
+
+# ---------------------------------------------------------------------------
+# On-demand, column-filtered downloads -- deliberately NOT persisted via
+# export_storage/job.export the way generate_and_persist_exports's output
+# is: a column selection varies per request, while the cached artifact
+# (job.export) must stay the stable "every column" default that repeated
+# GET /export calls keep re-serving (see history.py's _ensure_exports_
+# generated). Reuses _build_invoice_csv_bytes/_invoice_filename_seed so
+# there's exactly one CSV-row-building/naming implementation either way.
+# ---------------------------------------------------------------------------
+
+
+def build_invoice_csv_bytes(group: InvoiceGroup, selected_fields: list[str] | None = None) -> bytes:
+    """Public entry point for building one group's CSV outside the
+    persisted-export flow (the export routes' column-filtered branch)."""
+    return _build_invoice_csv_bytes(group, selected_fields)
+
+
+def invoice_csv_filename(job: Job, group: InvoiceGroup) -> str:
+    """Filename for a single group's on-demand CSV -- same naming
+    convention as the persisted path (_invoice_filename_seed), computed
+    fresh since there's no ExportedFile record to read it back from.
+    Sanitized the same way resolve_unique_filenames sanitizes the
+    persisted path's filenames: the seed can contain characters that are
+    invalid in a filename (a raw invoice number routinely contains '/',
+    e.g. "INV/2026/001") or, unsanitized, would land unescaped in a
+    Content-Disposition header."""
+    seed = _invoice_filename_seed(job, group, datetime.now(timezone.utc))
+    return f"{sanitize_filename(seed, fallback_index=1, fallback_prefix='invoice')}.csv"
+
+
+def build_filtered_zip_bytes(job: Job, selected_fields: list[str] | None) -> tuple[bytes, str]:
+    """On-demand zip build for a column-filtered multi-invoice download --
+    mirrors generate_and_persist_exports's zip step but returns bytes
+    directly instead of persisting anything."""
+    generated_at = datetime.now(timezone.utc)
+    filenames = resolve_unique_filenames(
+        [_invoice_filename_seed(job, group, generated_at) for group in job.invoice_groups],
+        fallback_prefix="invoice",
+    )
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_archive:
+        for group, base_filename in zip(job.invoice_groups, filenames):
+            zip_archive.writestr(f"{base_filename}.csv", _build_invoice_csv_bytes(group, selected_fields))
+    zip_filename = f"invoices_{job.job_id}_{generated_at.strftime('%Y%m%d')}.zip"
+    return zip_buffer.getvalue(), zip_filename
 
 
 def find_group_by_invoice_number(job: Job, invoice_number: str) -> InvoiceGroup | None:

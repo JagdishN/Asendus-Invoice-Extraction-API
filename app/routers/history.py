@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from app.core.auth import get_current_user
@@ -12,10 +12,15 @@ from app.core.job_store import get_job, list_jobs, save_job
 from app.models.schemas import ExportedFile, Job, JobStatus
 from app.services.csv_export import (
     CSV_MEDIA_TYPE,
+    LINE_ITEM_EXPORT_COLUMNS,
     ZIP_MEDIA_TYPE,
+    build_filtered_zip_bytes,
+    build_invoice_csv_bytes,
     find_group_by_invoice_number,
     generate_and_persist_exports,
+    invoice_csv_filename,
     populate_job_with_dummy_data,
+    resolve_selected_line_item_fields,
 )
 from app.services.export_storage import export_storage
 
@@ -103,22 +108,68 @@ def _ensure_exports_generated(job: Job) -> None:
         save_job(job)
 
 
-def _serve_exported_file(job: Job, exported_file: ExportedFile, media_type: str) -> StreamingResponse:
-    content = export_storage.read_bytes(job.job_id, exported_file.filename)
+def _stream_bytes(content: bytes, filename: str, media_type: str) -> StreamingResponse:
     return StreamingResponse(
         iter([content]),
         media_type=media_type,
-        headers={"Content-Disposition": f'attachment; filename="{exported_file.filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
+def _serve_exported_file(job: Job, exported_file: ExportedFile, media_type: str) -> StreamingResponse:
+    content = export_storage.read_bytes(job.job_id, exported_file.filename)
+    return _stream_bytes(content, exported_file.filename, media_type)
+
+
+def _parse_columns_param(columns: str | None) -> list[str] | None:
+    if not columns:
+        return None
+    return [c.strip() for c in columns.split(",") if c.strip()]
+
+
+_COLUMNS_QUERY_DESCRIPTION = (
+    "Comma-separated line-item field names to include (see GET "
+    "/api/jobs/export/columns for the available names) -- omit, or leave "
+    "empty, for every column. A column-filtered download is always built "
+    "fresh, never cached: repeated calls with no `columns` still reuse "
+    "the same persisted 'every column' export."
+)
+
+
+@router.get("/export/columns")
+async def get_export_columns(current_user: str = Depends(get_current_user)):
+    """
+    The line-item table's exportable columns (field_name + display label,
+    in canonical CSV order) -- for a client-side "choose which columns to
+    export" dropdown. Not job-specific: this is the same fixed set,
+    schema-derived list for every job (see csv_export.LINE_ITEM_EXPORT_
+    COLUMNS), so no job_id is needed. Default UI state should be every
+    column selected -- pass all field_names (or omit `columns` entirely)
+    on export to get that.
+    """
+    return {"columns": LINE_ITEM_EXPORT_COLUMNS}
+
+
 @router.get("/{job_id}/export")
-async def export_job(job_id: UUID, current_user: str = Depends(get_current_user)):
+async def export_job(
+    job_id: UUID,
+    columns: str | None = Query(None, description=_COLUMNS_QUERY_DESCRIPTION),
+    current_user: str = Depends(get_current_user),
+):
     """Default download: the zip if the job has more than one invoice,
     otherwise the single CSV directly."""
     job = _require_job_with_invoices(job_id)
-    _ensure_exports_generated(job)
+    selected_fields = resolve_selected_line_item_fields(_parse_columns_param(columns))
 
+    if selected_fields is not None:
+        if len(job.invoice_groups) > 1:
+            content, filename = build_filtered_zip_bytes(job, selected_fields)
+            return _stream_bytes(content, filename, ZIP_MEDIA_TYPE)
+        only_group = job.invoice_groups[0]
+        content = build_invoice_csv_bytes(only_group, selected_fields)
+        return _stream_bytes(content, invoice_csv_filename(job, only_group), CSV_MEDIA_TYPE)
+
+    _ensure_exports_generated(job)
     if job.export.zip_file is not None:
         return _serve_exported_file(job, job.export.zip_file, ZIP_MEDIA_TYPE)
 
@@ -128,15 +179,17 @@ async def export_job(job_id: UUID, current_user: str = Depends(get_current_user)
 
 
 @router.get("/{job_id}/export/zip")
-async def export_job_zip(job_id: UUID, current_user: str = Depends(get_current_user)):
+async def export_job_zip(
+    job_id: UUID,
+    columns: str | None = Query(None, description=_COLUMNS_QUERY_DESCRIPTION),
+    current_user: str = Depends(get_current_user),
+):
     """Explicitly returns the zip archive. 404s for single-invoice jobs,
     since no zip is generated for those (use /export or
     /export/{invoice_number} instead) -- this was a judgment call, not
     explicitly specified; confirm it's the behavior you want."""
     job = _require_job_with_invoices(job_id)
-    _ensure_exports_generated(job)
-
-    if job.export.zip_file is None:
+    if len(job.invoice_groups) <= 1:
         raise HTTPException(
             status_code=404,
             detail=(
@@ -144,11 +197,23 @@ async def export_job_zip(job_id: UUID, current_user: str = Depends(get_current_u
                 "Use /export or /export/{invoice_number} instead."
             ),
         )
+
+    selected_fields = resolve_selected_line_item_fields(_parse_columns_param(columns))
+    if selected_fields is not None:
+        content, filename = build_filtered_zip_bytes(job, selected_fields)
+        return _stream_bytes(content, filename, ZIP_MEDIA_TYPE)
+
+    _ensure_exports_generated(job)
     return _serve_exported_file(job, job.export.zip_file, ZIP_MEDIA_TYPE)
 
 
 @router.get("/{job_id}/export/{invoice_number:path}")
-async def export_invoice_csv(job_id: UUID, invoice_number: str, current_user: str = Depends(get_current_user)):
+async def export_invoice_csv(
+    job_id: UUID,
+    invoice_number: str,
+    columns: str | None = Query(None, description=_COLUMNS_QUERY_DESCRIPTION),
+    current_user: str = Depends(get_current_user),
+):
     """
     Returns just one invoice's CSV, looked up by invoice number. Uses the
     ':path' converter (not a plain '{invoice_number}') because invoice
@@ -157,8 +222,6 @@ async def export_invoice_csv(job_id: UUID, invoice_number: str, current_user: st
     invoice numbers.
     """
     job = _require_job_with_invoices(job_id)
-    _ensure_exports_generated(job)
-
     group = find_group_by_invoice_number(job, invoice_number)
     if group is None:
         raise HTTPException(
@@ -166,6 +229,12 @@ async def export_invoice_csv(job_id: UUID, invoice_number: str, current_user: st
             detail=f"Invoice '{invoice_number}' was not found in this job.",
         )
 
+    selected_fields = resolve_selected_line_item_fields(_parse_columns_param(columns))
+    if selected_fields is not None:
+        content = build_invoice_csv_bytes(group, selected_fields)
+        return _stream_bytes(content, invoice_csv_filename(job, group), CSV_MEDIA_TYPE)
+
+    _ensure_exports_generated(job)
     exported_file = job.export.invoice_files[str(group.group_id)]
     return _serve_exported_file(job, exported_file, CSV_MEDIA_TYPE)
 

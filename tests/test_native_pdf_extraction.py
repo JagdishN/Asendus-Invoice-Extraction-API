@@ -4,10 +4,11 @@ from app.services.native_pdf_extraction import (
     INVOICE_TOTAL_LABELS,
     _extract_amount_field,
     _extract_invoice_number,
+    _split_description_and_pack,
     extract_invoice_group_fields,
     extract_page_invoice_numbers,
 )
-from tests.pdf_builders import SAMPLE_IRN, build_blank_pdf_bytes, build_invoice_pdf_bytes
+from tests.pdf_builders import SAMPLE_IRN, build_blank_pdf_bytes, build_invoice_pdf_bytes, build_pharma_invoice_pdf_bytes
 
 SAMPLE_INVOICE = dict(
     invoice_number="INV/2026/001",
@@ -156,3 +157,58 @@ def test_table_without_ruling_lines_returns_empty_line_items_not_a_guess():
     _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
 
     assert line_items == []
+
+
+# ---------------------------------------------------------------------------
+# item_description -> pack splitting (client-confirmed: the packing
+# reference after a product name's trailing " -<pack>" is its own column,
+# not part of the description) -- see _split_description_and_pack.
+# ---------------------------------------------------------------------------
+
+
+def test_split_description_and_pack_no_space_before_pack_token():
+    description, pack = _split_description_and_pack("Nefrosave Forte Tablets -15s")
+    assert description == "Nefrosave Forte Tablets"
+    assert pack == "15s"
+
+
+def test_split_description_and_pack_space_before_pack_token():
+    description, pack = _split_description_and_pack("K Mac B6 Active Liquid - 200ml")
+    assert description == "K Mac B6 Active Liquid"
+    assert pack == "200ml"
+
+
+def test_split_description_and_pack_no_hyphen_leaves_description_unchanged():
+    description, pack = _split_description_and_pack("Industrial Bearings Set")
+    assert description == "Industrial Bearings Set"
+    assert pack is None
+
+
+def test_split_description_and_pack_hyphen_with_no_preceding_space_is_not_a_pack_split():
+    # A mid-word compound name (no space before the hyphen) is never
+    # mistaken for a pack reference.
+    description, pack = _split_description_and_pack("Anti-Inflammatory Tablets")
+    assert description == "Anti-Inflammatory Tablets"
+    assert pack is None
+
+
+def test_split_description_and_pack_splits_at_the_last_hyphen_when_there_are_several():
+    description, pack = _split_description_and_pack("Multi - Vitamin Syrup - 200ml")
+    assert description == "Multi - Vitamin Syrup"
+    assert pack == "200ml"
+
+
+def test_pack_split_applied_end_to_end_to_extracted_line_items():
+    line_item = dict(
+        sr=1, description="Paracetamol 500mg Tab -15s", hsn="3004", batch="B2201", expiry="12/2027",
+        sold=100, free="", total_qty=100, mrp="15.00", ptr="10.50", rate_pts="",
+        total_amt="1050.00", discount="21.00", taxable="1029.00",
+        cgst_rate="6%", cgst_amt="61.74", sgst_rate="6%", sgst_amt="61.74",
+        igst_rate="", igst_amt="",
+    )
+    pdf_bytes = build_pharma_invoice_pdf_bytes(line_items=[line_item])
+    _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
+
+    assert len(line_items) == 1
+    assert line_items[0].item_description == "Paracetamol 500mg Tab"
+    assert line_items[0].pack == "15s"

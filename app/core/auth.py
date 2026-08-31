@@ -17,8 +17,8 @@ happens:
 
 Test credentials (see README for the user-facing callout -- do not mistake
 this for a real security posture):
-    username: TEST_USERNAME env var, default "testuser"
-    password: TEST_PASSWORD env var, default "testpass123" -- an obvious
+    username: TEST_USERNAME env var, default "Admin"
+    password: TEST_PASSWORD env var, default "Admin@123" -- an obvious
     placeholder, never a real secret.
 """
 

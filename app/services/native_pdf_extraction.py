@@ -838,6 +838,15 @@ def _extract_buyer_name(text: str) -> tuple[str | None, ConfidenceBand]:
     test, or the OCR path), it still searches the whole thing, same as
     before."""
     raw = _search_labeled_value(text, BUYER_NAME_LABELS, _LINE_TEXT_VALUE)
+    if raw is not None and raw.lstrip().startswith("/"):
+        # "Bill To / Place of Supply:" -- a compound SECTION TITLE, not an
+        # inline "Bill To: <name>" label (confirmed on a real invoice
+        # whose actual buyer name is on the row below this label, not on
+        # the label's own row). Rejected so this falls through to
+        # NOT_FOUND and lets the row-after-section-header fallback (see
+        # extract_invoice_group_fields) pick up the real name instead of
+        # this label's own "/ Place of Supply" continuation text.
+        raw = None
     if raw is None:
         return None, ConfidenceBand.NOT_FOUND
     return raw, (ConfidenceBand.HIGH if len(raw) >= 2 else ConfidenceBand.REVIEW)
@@ -1125,6 +1134,26 @@ def _normalize_cell_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
+# Real invoices commonly append a packing reference to the product name,
+# separated by " -" (e.g. "Nefrosave Forte Tablets -15s", "K Mac B6
+# Active Liquid - 200ml") -- client-confirmed requirement to split this
+# into its own `pack` field rather than leave it embedded in
+# item_description. The prefix group is greedy so a description with an
+# earlier, unrelated " - " (e.g. "Multi - Vitamin Syrup - 200ml") still
+# splits at the LAST such point, not the first. A hyphen with no
+# preceding space (e.g. "Anti-Inflammatory") never matches -- deliberately
+# narrower than "any hyphen" so a mid-word compound name isn't mistaken
+# for a pack reference.
+_PACK_SUFFIX_RE = re.compile(r"^(.*\S)\s-\s*(\S+)$")
+
+
+def _split_description_and_pack(description: str) -> tuple[str, str | None]:
+    match = _PACK_SUFFIX_RE.match(description)
+    if match is None:
+        return description, None
+    return match.group(1).strip(), match.group(2).strip()
+
+
 # A row with a real, non-empty description cell and a real-looking number in
 # one of the amount columns is otherwise indistinguishable from a genuine
 # line item by column position alone -- but a running "Total for <brand>"/
@@ -1400,6 +1429,179 @@ _STRONG_HEADER_MIN_COLUMNS = 5
 # data rows get their attempted column assignment recorded for inspection.
 # Independent of _MAX_POSITIONAL_TABLE_ROWS, which bounds actual parsing.
 _DIAGNOSTIC_SAMPLE_ROW_COUNT = 5
+
+
+# ---------------------------------------------------------------------------
+# Alternate line-item format: "batch detail on its own row" (confirmed
+# real invoice -- AbbVie Therapeutics). Each line item prints across TWO
+# physical rows instead of one:
+#   item row:   <item code> <material code> <description...> <qty> <uom>
+#               <mrp> <dist price> <retail price> <trade price> <igst%> <value>
+#   detail row: <hsn code>  BATCH NO:<batch>  EXP DT : <expiry>  MFG DT : <mfg>  [<qty repeated>]
+#
+# This is structurally incompatible with the single-row-per-item column-
+# boundary model _extract_line_items_positional uses (one header word ->
+# one X-range -> one field): the detail row's "HSN"/"batch"/"expiry"/
+# "mfg date" all sit in what would otherwise be the Description column's
+# X-range on THIS row, not in their own columns. Bending the existing
+# column-boundary machinery to understand "this row's Description column
+# actually means something different" would make it fragile for every
+# other format it already handles correctly -- so this is its own
+# dedicated, narrowly-triggered parser instead, selected per-page (see
+# extract_invoice_group_fields) ONLY when a row's text actually matches
+# the literal "BATCH NO:" inline pattern below. No other confirmed format
+# triggers this: elsewhere "batch"/"no" are separate column HEADER words
+# with the batch value alone in its own cell, never glued together with a
+# colon like "BATCH NO:125640".
+# ---------------------------------------------------------------------------
+
+_BATCH_DETAIL_ROW_SIGNATURE_RE = re.compile(r"batch\s*no\s*:", re.IGNORECASE)
+
+_BATCH_DETAIL_ITEM_ROW_RE = re.compile(
+    r"^\d{4,8}\s+"  # item/line code
+    r"\S+\s+"  # material code
+    r"(?P<description>.+?)\s+"
+    r"(?P<quantity>[\d,]+\.\d+)\s+"
+    r"(?P<uom>[A-Za-z]+)\s+"
+    r"(?P<mrp>[\d,]+\.\d+)\s+"
+    r"(?P<dist_price>[\d,]+\.\d+)\s+"
+    r"(?P<retail_price>[\d,]+\.\d+)\s+"
+    r"(?P<trade_price>[\d,]+\.\d+)\s+"
+    r"(?P<igst_rate>[\d,]+\.\d+)%\s+"
+    r"(?P<value>[\d,]+\.\d+)\s*$"
+)
+
+_BATCH_DETAIL_ROW_RE = re.compile(
+    r"^(?P<hsn>\d{4,8})\s+"
+    r"batch\s*no\s*:\s*(?P<batch>\S+)\s+"
+    r"exp\s*dt\s*:?\s*(?P<expiry>\S+)\s+"
+    r"mfg\s*dt\s*:?\s*(?P<mfg>\S+)"
+    r"(?:\s+[\d,]+\.\d+)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _split_description_and_pack_trailing_number(description: str) -> tuple[str, str | None]:
+    """
+    Pack-split rule for the batch-detail-row format ONLY: the LAST
+    whitespace-separated token that starts with a digit, through to the
+    end of the string, is the pack (e.g. "GLUCOMOL 0.5% 5 ML" -> pack
+    "5 ML"; "COMBIGAN OPTHALMIC SOLN 5ML SALE 1100 L" -> pack "1100 L",
+    since the earlier "5ML" is NOT the last digit-led token). Client-
+    confirmed rule for this format specifically.
+
+    Deliberately a SEPARATE function from _split_description_and_pack
+    (the hyphen-based rule used by the positional/find_tables() paths
+    elsewhere): reusing that rule here would miss these (no hyphen at
+    all), and reusing THIS rule elsewhere would wrongly fire on something
+    like "Paracetamol 500mg Tab" (splitting off "500mg Tab" as if it were
+    a pack) -- each stays scoped to the format it was confirmed against.
+
+    A literal reading of "last number to end", not a smarter "last
+    number immediately followed by a unit" heuristic -- confirmed
+    against a real description ("RESTASIS ... 30 X 0.4 ML FLOW WRAP")
+    where the literal rule pulls in more trailing words than a human
+    would call "the pack size" (pack ends up "0.4 ML FLOW WRAP"); still
+    applied as literally specified rather than second-guessed.
+    """
+    tokens = description.split()
+    split_idx = None
+    for i in range(len(tokens) - 1, -1, -1):
+        if tokens[i][:1].isdigit():
+            split_idx = i
+            break
+    if split_idx is None:
+        return description, None
+    return " ".join(tokens[:split_idx]).strip(), " ".join(tokens[split_idx:]).strip()
+
+
+def _extract_line_items_batch_detail_rows(
+    rows: list[list[Word]], diagnostics: dict | None = None
+) -> list[InvoiceLineItem]:
+    """
+    Dedicated parser for the "batch detail on its own row" format -- see
+    the module comment above _BATCH_DETAIL_ROW_SIGNATURE_RE. Pairs each
+    item row with its detail row (the next row matching
+    _BATCH_DETAIL_ROW_RE), scanning FORWARD past any number of
+    intervening non-matching rows to find it -- not just the immediately
+    next row. Necessary because `rows` is meant to be the WHOLE group's
+    pooled rows (see extract_invoice_group_fields), and a page break can
+    land between an item row and its own detail row with an entire
+    reprinted header/address/payment-info boilerplate block in between
+    (confirmed on a real invoice: the last item on page 1 had its detail
+    row as the first table row of page 2, separated by that page's full
+    letterhead reprint). The forward scan stops (giving up on a detail
+    row for this item) the moment it hits ANOTHER item row first, so a
+    genuinely detail-less item can never accidentally swallow the next
+    item's own rows while searching.
+
+    An item row with no matching detail row still becomes a line item,
+    just without hsn/batch/expiry/mfg_date populated (recorded in
+    diagnostics rather than silently dropped). Rows that match neither
+    pattern (headers, page boilerplate, the repeated "Description /
+    Batch and Expiry Date" sub-header) are silently skipped -- unlike the
+    column-boundary parser, a non-matching row here can never be mistaken
+    for real data, so there's no "table end" detection to run.
+    """
+    line_items: list[InvoiceLineItem] = []
+    unmatched_item_rows: list[str] = []
+    row_idx = 0
+    while row_idx < len(rows):
+        row = rows[row_idx]
+        match = _BATCH_DETAIL_ITEM_ROW_RE.match(row_text(row))
+        if match is None:
+            row_idx += 1
+            continue
+
+        raw_description = _normalize_cell_text(match.group("description"))
+        description, pack = _split_description_and_pack_trailing_number(raw_description)
+        item_kwargs = dict(
+            line_number=len(line_items) + 1,
+            item_description=description,
+            pack=pack,
+            quantity=_parse_amount(match.group("quantity")),
+            uom=match.group("uom"),
+            mrp=_parse_amount(match.group("mrp")),
+            ptr=_parse_amount(match.group("trade_price")),
+            igst_rate=_parse_amount(match.group("igst_rate")),
+            line_total=_parse_amount(match.group("value")),
+            source_page=row[0].page_number,
+        )
+
+        detail_match = None
+        rows_consumed = 1
+        scan_idx = row_idx + 1
+        while scan_idx < len(rows):
+            candidate_text = row_text(rows[scan_idx])
+            detail_match = _BATCH_DETAIL_ROW_RE.match(candidate_text)
+            if detail_match is not None:
+                rows_consumed = scan_idx - row_idx + 1
+                break
+            if _BATCH_DETAIL_ITEM_ROW_RE.match(candidate_text) is not None:
+                break  # the next real item -- stop, this one has no detail row
+            scan_idx += 1
+
+        if detail_match is not None:
+            item_kwargs.update(
+                hsn_sac=detail_match.group("hsn"),
+                batch_number=detail_match.group("batch"),
+                expiry_date=detail_match.group("expiry"),
+                mfg_date=detail_match.group("mfg"),
+            )
+            row_idx += rows_consumed
+        else:
+            unmatched_item_rows.append(row_text(row))
+            row_idx += 1
+
+        line_items.append(InvoiceLineItem(**item_kwargs))
+
+    if diagnostics is not None:
+        diagnostics.update(
+            format="batch_detail_rows",
+            line_items_produced=len(line_items),
+            item_rows_without_a_matching_detail_row=unmatched_item_rows,
+        )
+    return line_items
 
 
 def _word_to_dict(word: Word) -> dict:
@@ -2063,39 +2265,67 @@ def extract_invoice_group_fields(
         if table_diagnostics is not None:
             table_diagnostics["find_tables"] = find_tables_diag
 
-        # Run PER PAGE, not once over the whole group's pooled rows -- a
-        # multi-page invoice commonly reprints its full header/customer/
-        # address block at the top of every continuation page (confirmed
-        # against a real 4-page invoice). Pooling every page's rows into
-        # one continuous scan meant that block was scanned using page 1's
-        # column boundaries once the real table ended, and enough of its
-        # words happened to fall inside those boundaries by X-coincidence
-        # to be emitted as garbage line items (e.g. "GSTIN", "DESCRIPTION"
-        # itself) instead of being recognized as off-table content and
-        # stopped on. Scoping the header-detect/parse/stop cycle to one
-        # page at a time means each page's own boilerplate can only ever
-        # run into ITS OWN table-end detection, not bleed into the next.
         should_run_positional = not line_items and general_rows is not None
         positional_diag = None
         if should_run_positional:
-            pages_with_rows = sorted({row[0].page_number for row in general_rows if row})
-            per_page_diags = [] if table_diagnostics is not None else None
-            positional_items: list[InvoiceLineItem] = []
-            line_number_offset = 0
-            for pg in pages_with_rows:
-                page_rows = [row for row in general_rows if row and row[0].page_number == pg]
-                page_diag = {} if per_page_diags is not None else None
-                page_items = _extract_line_items_positional(page_rows, diagnostics=page_diag)
-                for item in page_items:
-                    item.line_number += line_number_offset
-                line_number_offset += len(page_items)
-                positional_items.extend(page_items)
-                if per_page_diags is not None:
-                    page_diag["page_number"] = pg
-                    per_page_diags.append(page_diag)
-            line_items = positional_items
-            if table_diagnostics is not None:
-                positional_diag = {"pages": per_page_diags, "line_items_produced": len(line_items)}
+            # Whole-group fork, checked ONCE before deciding how to scan
+            # at all: a document using the batch-detail-row format (see
+            # _extract_line_items_batch_detail_rows' module comment) is
+            # run as ONE pooled pass over every page's rows together, NOT
+            # per-page like the generic positional parser below. Reason:
+            # this format's line items are pairs of adjacent PHYSICAL
+            # rows (item row + detail row), and that pairing can span a
+            # page break (confirmed on a real invoice -- the last item on
+            # page 1 had its detail row printed as the first row of page
+            # 2); per-page scoping would cut the pair apart and lose the
+            # detail row's hsn/batch/expiry/mfg_date entirely. This is
+            # safe to pool (unlike the generic parser -- see below):
+            # _BATCH_DETAIL_ITEM_ROW_RE/_BATCH_DETAIL_ROW_RE are strict,
+            # fully-anchored shape matches, not a loose column-boundary
+            # guess, so a reprinted boilerplate row on page 2 can't
+            # accidentally satisfy either pattern the way it could
+            # accidentally land inside a column's X-range.
+            uses_batch_detail_format = any(
+                _BATCH_DETAIL_ROW_SIGNATURE_RE.search(row_text(row)) for row in general_rows if row
+            )
+            if uses_batch_detail_format:
+                batch_diag = {} if table_diagnostics is not None else None
+                line_items = _extract_line_items_batch_detail_rows(general_rows, diagnostics=batch_diag)
+                if table_diagnostics is not None:
+                    positional_diag = {"pages": [batch_diag], "line_items_produced": len(line_items)}
+            else:
+                # Run PER PAGE, not once over the whole group's pooled rows
+                # -- a multi-page invoice commonly reprints its full
+                # header/customer/address block at the top of every
+                # continuation page (confirmed against a real 4-page
+                # invoice). Pooling every page's rows into one continuous
+                # scan meant that block was scanned using page 1's column
+                # boundaries once the real table ended, and enough of its
+                # words happened to fall inside those boundaries by
+                # X-coincidence to be emitted as garbage line items (e.g.
+                # "GSTIN", "DESCRIPTION" itself) instead of being
+                # recognized as off-table content and stopped on. Scoping
+                # the header-detect/parse/stop cycle to one page at a time
+                # means each page's own boilerplate can only ever run into
+                # ITS OWN table-end detection, not bleed into the next.
+                pages_with_rows = sorted({row[0].page_number for row in general_rows if row})
+                per_page_diags = [] if table_diagnostics is not None else None
+                positional_items: list[InvoiceLineItem] = []
+                line_number_offset = 0
+                for pg in pages_with_rows:
+                    page_rows = [row for row in general_rows if row and row[0].page_number == pg]
+                    page_diag = {} if per_page_diags is not None else None
+                    page_items = _extract_line_items_positional(page_rows, diagnostics=page_diag)
+                    for item in page_items:
+                        item.line_number += line_number_offset
+                    line_number_offset += len(page_items)
+                    positional_items.extend(page_items)
+                    if per_page_diags is not None:
+                        page_diag["page_number"] = pg
+                        per_page_diags.append(page_diag)
+                line_items = positional_items
+                if table_diagnostics is not None:
+                    positional_diag = {"pages": per_page_diags, "line_items_produced": len(line_items)}
         if table_diagnostics is not None:
             table_diagnostics["positional_parser"] = positional_diag
             table_diagnostics["positional_parser_ran"] = should_run_positional
@@ -2103,5 +2333,17 @@ def extract_invoice_group_fields(
             on_table_diagnostics(table_diagnostics)
     finally:
         doc.close()
+
+    # Applied once, centrally, to every produced item regardless of which
+    # extraction path (find_tables() or the positional fallback, on any
+    # page) built it -- see _split_description_and_pack. Skipped for an
+    # item that already has a pack (the batch-detail-row format's own
+    # parser sets it via a DIFFERENT rule, _split_description_and_pack_
+    # trailing_number -- this would otherwise unconditionally overwrite
+    # that with this rule's result, which is None whenever there's no
+    # hyphen, silently discarding a correctly-split pack).
+    for item in line_items:
+        if item.pack is None:
+            item.item_description, item.pack = _split_description_and_pack(item.item_description)
 
     return header_fields, header_field_confidences, line_items

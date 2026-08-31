@@ -671,3 +671,100 @@ def build_ambiguous_column_headers_pdf_bytes() -> bytes:
     c.showPage()
     c.save()
     return buffer.getvalue()
+
+
+# Reproduces the confirmed "batch detail on its own row" real-invoice
+# layout (AbbVie Therapeutics format, see native_pdf_extraction.py's
+# _extract_line_items_batch_detail_rows): "GLUCOMOL 0.5% 5 ML" and
+# "NOVORET NEO 10 SOFTGEL" are the real invoice's own first two items.
+_DEFAULT_BATCH_DETAIL_LINE_ITEMS = [
+    {
+        "item_code": "000010", "material": "8015II", "description": "GLUCOMOL 0.5% 5 ML",
+        "hsn": "30049079", "batch": "125640", "expiry": "MAR-2028", "mfg": "APR-2026",
+        "quantity": "144.000", "uom": "EA", "mrp": "71.97", "dist_price": "54.36",
+        "retail_price": "68.54", "trade_price": "59.09", "igst_rate": "5.00", "value": "7,827.84",
+    },
+    {
+        "item_code": "000030", "material": "96105II", "description": "NOVORET NEO 10 SOFTGEL",
+        "hsn": "21069099", "batch": "NNG25003", "expiry": "MAY-2027", "mfg": "JUN-2025",
+        "quantity": "20.000", "uom": "EA", "mrp": "312.41", "dist_price": "214.22",
+        "retail_price": "297.53", "trade_price": "238.02", "igst_rate": "5.00", "value": "4,284.40",
+    },
+]
+
+
+def build_batch_detail_row_invoice_pdf_bytes(
+    *,
+    vendor_name: str = "AbbVie Therapeutics India Pvt. Ltd.",
+    buyer_name: str = "JYOTHI MEDICAL HALL",
+    line_items: list[dict] | None = None,
+    boilerplate_between_pair: str | None = None,
+) -> bytes:
+    """
+    Each line item prints across TWO physical text rows: an item row
+    (item code / material code / description+pack / quantity / uom / mrp
+    / dist price / retail price / trade price / igst% / value) and,
+    normally immediately after it, a detail row ("<hsn> BATCH NO:<batch>
+    EXP DT : <expiry> MFG DT : <mfg> <quantity repeated>"). Pass
+    boilerplate_between_pair to insert an unrelated text row between each
+    item row and its own detail row -- simulates a page-break reprint
+    landing between the pair (confirmed real: the last item on a real
+    invoice's page 1 had its detail row pushed to the top of page 2, with
+    that page's whole letterhead reprint in between).
+
+    No ruled table lines are drawn -- confirmed against the real sample,
+    where PyMuPDF's find_tables() found nothing at all, so this format is
+    always reached via the positional path.
+    """
+    if line_items is None:
+        line_items = _DEFAULT_BATCH_DETAIL_LINE_ITEMS
+
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    _width, height = A4
+    left_x = 20
+    y = height - 30
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(left_x, y, "TAX INVOICE")
+    y -= 20
+
+    c.setFont("Helvetica", 9)
+    c.drawString(left_x, y, "Bill To / Place of Supply:")
+    y -= 12
+    c.drawString(left_x, y, buyer_name)
+    y -= 20
+
+    c.drawString(
+        left_x, y,
+        "Item Material HSN Description Batch and Expiry Date Quantity UOM "
+        "MRP Inc.all Prices Dist.price Retail Price Trade Price IGST% Value",
+    )
+    y -= 16
+
+    for item in line_items:
+        item_row = (
+            f"{item['item_code']} {item['material']} {item['description']} "
+            f"{item['quantity']} {item['uom']} {item['mrp']} {item['dist_price']} "
+            f"{item['retail_price']} {item['trade_price']} {item['igst_rate']}% {item['value']}"
+        )
+        c.drawString(left_x, y, item_row)
+        y -= 12
+
+        if boilerplate_between_pair:
+            c.drawString(left_x, y, boilerplate_between_pair)
+            y -= 12
+
+        detail_row = (
+            f"{item['hsn']} BATCH NO:{item['batch']} EXP DT : {item['expiry']} "
+            f"MFG DT : {item['mfg']} {item['quantity']}"
+        )
+        c.drawString(left_x, y, detail_row)
+        y -= 16
+
+    y -= 10
+    c.drawString(left_x, y, f"For {vendor_name}")
+
+    c.showPage()
+    c.save()
+    return buffer.getvalue()
