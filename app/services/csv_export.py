@@ -4,11 +4,13 @@ together when a job has more than one. Generated files are persisted via
 export_storage.py (local disk for now) so they can be served again without
 regenerating -- see JobExportMetadata in schemas.py for what gets recorded.
 
-Each CSV has a header block (InvoiceGroup.header_fields, plus a couple of
-top-level InvoiceGroup fields for context) as its own rows, a blank
-separator row, then the line-items table. Columns are derived from
-InvoiceLineItem's own fields so they can't drift out of sync with
-schemas.py.
+Client-confirmed: the CSV body is the line-items TABLE ONLY -- no header
+block (invoice number, buyer/party details, tax-bracket summary, etc.),
+no blank separator row. Columns are derived from InvoiceLineItem's own
+fields so they can't drift out of sync with schemas.py. header_fields is
+still read from InvoiceGroup elsewhere (filename generation -- see
+_invoice_filename_seed below) even though it no longer appears in the CSV
+content itself; the file NAMING convention is unchanged.
 """
 
 from __future__ import annotations
@@ -111,28 +113,6 @@ def _build_invoice_csv_bytes(group: InvoiceGroup, selected_fields: list[str] | N
     fields = selected_fields if selected_fields is not None else _LINE_ITEM_FIELDS
     buffer = io.StringIO()
     writer = csv.writer(buffer)
-
-    writer.writerow(["Invoice Number", group.invoice_number or ""])
-    writer.writerow(["Source Pages", ", ".join(str(p) for p in group.source_page_list)])
-    if group.is_non_contiguous_merge:
-        writer.writerow(["Non-Contiguous Merge", "Yes - confirm before relying on totals"])
-    for key, value in group.header_fields.items():
-        if key == "tax_bracket_summary" and isinstance(value, list):
-            # Nested list-of-dicts doesn't fit the flat label/value row
-            # shape below -- render one row per GST rate bracket instead of
-            # dumping a stringified list into a single cell. Kept separate
-            # from per-line-item tax fields, no consolidation between them.
-            for bracket in value:
-                writer.writerow(
-                    [
-                        f"Tax Bracket {bracket.get('rate')}%",
-                        f"Taxable: {bracket.get('taxable_amount')}, Tax: {bracket.get('tax_amount')}",
-                    ]
-                )
-            continue
-        writer.writerow([key, value])
-
-    writer.writerow([])  # blank separator row before the line-items table
 
     writer.writerow([_LINE_ITEM_COLUMN_LABELS.get(f, f.replace("_", " ").title()) for f in fields])
     for item in group.line_items:

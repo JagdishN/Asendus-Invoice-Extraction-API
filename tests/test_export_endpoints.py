@@ -83,9 +83,11 @@ def test_export_single_invoice_by_number_returns_that_invoices_csv(client):
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/csv")
 
-    content = resp.content.decode("utf-8-sig")
-    assert "INV/2026/040" in content
-    assert "INV/2026/041" not in content
+    # The CSV body is table-only now (no invoice-number text in it at all)
+    # -- verify the correct group was selected via the filename instead,
+    # which still encodes the invoice number's last 5 chars.
+    assert "040" in resp.headers["content-disposition"]
+    assert "041" not in resp.headers["content-disposition"]
 
 
 def test_export_unknown_invoice_number_404s(client):
@@ -146,8 +148,7 @@ def test_export_with_columns_param_returns_only_selected_line_item_columns(clien
     assert resp.status_code == 200
     content = resp.content.decode("utf-8-sig")
     rows = list(csv.reader(content.splitlines()))
-    blank_row_index = next(i for i, row in enumerate(rows) if row == [])
-    assert rows[blank_row_index + 1] == ["Line #", "Item Description"]
+    assert rows[0] == ["Line #", "Item Description"]
 
 
 def test_export_with_columns_param_is_not_cached_as_the_default_export(client):
@@ -182,8 +183,7 @@ def test_export_zip_with_columns_param_filters_every_csv_in_the_zip(client):
         for name in zf.namelist():
             content = zf.read(name).decode("utf-8-sig")
             rows = list(csv.reader(content.splitlines()))
-            blank_row_index = next(i for i, row in enumerate(rows) if row == [])
-            assert rows[blank_row_index + 1] == ["Line #", "Item Description"]
+            assert rows[0] == ["Line #", "Item Description"]
 
 
 def test_export_single_invoice_by_number_with_columns_param(client):
@@ -193,8 +193,7 @@ def test_export_single_invoice_by_number_with_columns_param(client):
     assert resp.status_code == 200
     content = resp.content.decode("utf-8-sig")
     rows = list(csv.reader(content.splitlines()))
-    blank_row_index = next(i for i, row in enumerate(rows) if row == [])
-    assert rows[blank_row_index + 1] == ["Item Description"]
+    assert rows[0] == ["Item Description"]
 
 
 def test_debug_populate_dummy_data_endpoint_adds_groups_and_clears_stale_export(client):

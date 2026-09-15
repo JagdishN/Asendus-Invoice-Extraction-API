@@ -52,13 +52,19 @@ class Settings:
     # held in memory when explicitly asked for via this flag.
     debug_mode: bool = os.getenv("DEBUG", "false").lower() in ("1", "true", "yes")
 
-    # Tesseract page segmentation mode. Default 6 ("assume a single uniform
-    # block of text") tends to behave better than Tesseract's own default
-    # (3, full automatic page segmentation with OSD) on dense, form-style
-    # invoices -- see ocr_extraction.py. Override via env var to try 4
-    # (single column of variable-size text) or 11/12 (sparse text) against
-    # a real sample if 6 doesn't hold up.
-    ocr_psm: int = int(os.getenv("OCR_PSM", "6"))
+    # Tesseract page segmentation mode. 4 ("single column of variable-size
+    # text") is the CONFIRMED best default against a real photographed
+    # invoice sample (a dense pharma form with handwritten annotations and
+    # visible skew/fold damage) -- see ocr_extraction.py. Measured directly
+    # against that sample: PSM 6 ("assume a single uniform block of text",
+    # the previous default) produced noticeably more garbage/noise tokens
+    # from the handwritten margin notes bleeding into the form's own text
+    # blocks, while 4 kept the header block meaningfully more readable
+    # (e.g. "Invoice Date : 01/09/2026" came through cleanly under 4,
+    # unrecognizable under 6). Override via env var to try 3 (Tesseract's
+    # own full automatic page segmentation with OSD) or 11/12 (sparse text)
+    # against a different real sample if 4 doesn't hold up there.
+    ocr_psm: int = int(os.getenv("OCR_PSM", "4"))
 
 
 settings = Settings()

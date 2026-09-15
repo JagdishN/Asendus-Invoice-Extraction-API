@@ -1154,6 +1154,102 @@ def _split_description_and_pack(description: str) -> tuple[str, str | None]:
     return match.group(1).strip(), match.group(2).strip()
 
 
+# --- Line-item date normalization (expiry_date/mfg_date) -----------------
+# Client-confirmed: these must display in the short "DD-MMM-YYYY" form
+# (e.g. "01-Sep-2026") in the exported table. Pharma invoices routinely
+# print expiry/mfg as a whole MONTH only, with no day at all (confirmed
+# real raw shapes across formats already in this codebase: generic
+# find_tables()-based columns print e.g. "12/2027"; the batch-detail-row
+# format's own regex captures e.g. "MAR-2028") -- when there's no day in
+# the source, there's nothing to zero-pad into "DD-", so the output stays
+# "MMM-YYYY" rather than fabricating a day that was never printed.
+# Applied as ONE shared post-processing pass (see the pack-split loop at
+# the end of extract_invoice_group_fields, same pattern) so every
+# extraction path gets identical formatting instead of each one needing
+# its own date-formatting logic.
+_MONTH_ABBREVIATIONS = {
+    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
+}
+_MONTH_NAME_TO_NUMBER = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
+
+# Checked in this order: more specific (day present) patterns before their
+# day-less counterparts, so e.g. "01-MAR-2028" isn't left partially matched
+# by the day-less "MMM-YYYY" pattern.
+_DATE_DAY_MONTH_YEAR_NUMERIC_RE = re.compile(r"^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$")
+_DATE_DAY_MONTHNAME_YEAR_RE = re.compile(r"^(\d{1,2})[\s\/\-]([A-Za-z]{3,9})[\s\/\-,]+(\d{2,4})$")
+_DATE_MONTHNAME_DAY_YEAR_RE = re.compile(r"^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{2,4})$")
+_DATE_MONTHNAME_YEAR_RE = re.compile(r"^([A-Za-z]{3,9})[\s\/\-](\d{2,4})$")
+_DATE_MONTH_YEAR_NUMERIC_RE = re.compile(r"^(\d{1,2})[\/\-.](\d{2,4})$")
+
+
+def _normalize_date_year(raw_year: str) -> int:
+    # A 2-digit year (e.g. "28") is assumed 20xx -- every real date this
+    # normalizes is a near-future pharma expiry/mfg date, never a
+    # historical one, so there's no genuine 19xx/20xx ambiguity here.
+    year = int(raw_year)
+    return year + 2000 if year < 100 else year
+
+
+def _normalize_short_date(raw: str | None) -> str | None:
+    """
+    Best-effort normalization to "DD-MMM-YYYY" (or "MMM-YYYY" when the
+    source has no day -- see module comment above). Recognizes the actual
+    raw shapes seen across this codebase's invoice formats: numeric
+    DD/MM/YYYY (day-first, matching the Indian-invoice convention already
+    assumed elsewhere in this module), numeric MM/YYYY, "DD-MMM-YYYY"/
+    "DD MMM YYYY", "MMM-YYYY"/"MMM/YYYY", and a full month name
+    ("August 14, 2026"). Falls back to returning the raw value completely
+    UNCHANGED for anything else -- consistent with this codebase's
+    "don't guess" philosophy: a date shape this doesn't recognize is
+    safer left as printed than silently mangled by a wrong guess.
+    """
+    if not raw:
+        return raw
+    value = raw.strip()
+
+    match = _DATE_DAY_MONTH_YEAR_NUMERIC_RE.match(value)
+    if match:
+        day, month, year = int(match.group(1)), int(match.group(2)), _normalize_date_year(match.group(3))
+        if 1 <= day <= 31 and 1 <= month <= 12:
+            return f"{day:02d}-{_MONTH_ABBREVIATIONS[month]}-{year:04d}"
+
+    match = _DATE_DAY_MONTHNAME_YEAR_RE.match(value)
+    if match:
+        month = _MONTH_NAME_TO_NUMBER.get(match.group(2).lower())
+        if month:
+            day, year = int(match.group(1)), _normalize_date_year(match.group(3))
+            if 1 <= day <= 31:
+                return f"{day:02d}-{_MONTH_ABBREVIATIONS[month]}-{year:04d}"
+
+    match = _DATE_MONTHNAME_DAY_YEAR_RE.match(value)
+    if match:
+        month = _MONTH_NAME_TO_NUMBER.get(match.group(1).lower())
+        if month:
+            day, year = int(match.group(2)), _normalize_date_year(match.group(3))
+            if 1 <= day <= 31:
+                return f"{day:02d}-{_MONTH_ABBREVIATIONS[month]}-{year:04d}"
+
+    match = _DATE_MONTHNAME_YEAR_RE.match(value)
+    if match:
+        month = _MONTH_NAME_TO_NUMBER.get(match.group(1).lower())
+        if month:
+            return f"{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
+
+    match = _DATE_MONTH_YEAR_NUMERIC_RE.match(value)
+    if match:
+        month = int(match.group(1))
+        if 1 <= month <= 12:
+            return f"{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
+
+    return raw
+
+
 # A row with a real, non-empty description cell and a real-looking number in
 # one of the amount columns is otherwise indistinguishable from a genuine
 # line item by column position alone -- but a running "Total for <brand>"/
@@ -2345,5 +2441,7 @@ def extract_invoice_group_fields(
     for item in line_items:
         if item.pack is None:
             item.item_description, item.pack = _split_description_and_pack(item.item_description)
+        item.expiry_date = _normalize_short_date(item.expiry_date)
+        item.mfg_date = _normalize_short_date(item.mfg_date)
 
     return header_fields, header_field_confidences, line_items

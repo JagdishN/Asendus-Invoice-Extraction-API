@@ -19,3 +19,11 @@ Pillow==12.3.0
 #   Debian/Ubuntu:  apt-get install -y tesseract-ocr
 #   Windows (local dev): winget install --id UB-Mannheim.TesseractOCR -e
 # See app/services/ocr_extraction.py and the README for more.
+opencv-python-headless==5.0.0.93
+numpy==2.5.3
+# opencv is used ONLY for OCR pre-processing (deskew) in
+# app/services/ocr_extraction.py -- headless variant, no GUI/X11 deps, since
+# this is a server. numpy is a transitive requirement of opencv (bridging
+# PIL images to/from the arrays opencv operates on) and isn't otherwise
+# used directly. Neither is imported by native_pdf_extraction.py or any
+# other module -- a native-text PDF never loads this dependency at all.

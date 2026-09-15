@@ -37,8 +37,10 @@ def test_batch_detail_rows_produce_correct_line_items():
     assert first.pack == "5 ML"
     assert first.hsn_sac == "30049079"
     assert first.batch_number == "125640"
-    assert first.expiry_date == "MAR-2028"
-    assert first.mfg_date == "APR-2026"
+    # Raw "MAR-2028"/"APR-2026" (month/year, no day) normalize to
+    # short-date "Mar-2028"/"Apr-2026".
+    assert first.expiry_date == "Mar-2028"
+    assert first.mfg_date == "Apr-2026"
     assert first.quantity == 144.0
     assert first.uom == "EA"
     assert first.mrp == 71.97

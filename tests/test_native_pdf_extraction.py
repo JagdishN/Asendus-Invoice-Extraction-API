@@ -4,6 +4,7 @@ from app.services.native_pdf_extraction import (
     INVOICE_TOTAL_LABELS,
     _extract_amount_field,
     _extract_invoice_number,
+    _normalize_short_date,
     _split_description_and_pack,
     extract_invoice_group_fields,
     extract_page_invoice_numbers,
@@ -212,3 +213,49 @@ def test_pack_split_applied_end_to_end_to_extracted_line_items():
     assert len(line_items) == 1
     assert line_items[0].item_description == "Paracetamol 500mg Tab"
     assert line_items[0].pack == "15s"
+
+
+# ---------------------------------------------------------------------------
+# expiry_date/mfg_date short-date normalization (client-confirmed:
+# "DD-MMM-YYYY", or "MMM-YYYY" when the source has no day at all).
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_short_date_numeric_day_month_year():
+    assert _normalize_short_date("01/09/2026") == "01-Sep-2026"
+    assert _normalize_short_date("14-07-2026") == "14-Jul-2026"
+    assert _normalize_short_date("5.3.2028") == "05-Mar-2028"
+
+
+def test_normalize_short_date_numeric_month_year_only_has_no_day():
+    assert _normalize_short_date("12/2027") == "Dec-2027"
+    assert _normalize_short_date("03-28") == "Mar-2028"  # 2-digit year assumed 20xx
+
+
+def test_normalize_short_date_month_name_year_only_has_no_day():
+    assert _normalize_short_date("MAR-2028") == "Mar-2028"
+    assert _normalize_short_date("Apr/2026") == "Apr-2026"
+
+
+def test_normalize_short_date_day_month_name_year():
+    assert _normalize_short_date("01-MAR-2028") == "01-Mar-2028"
+    assert _normalize_short_date("14 Jul 2026") == "14-Jul-2026"
+
+
+def test_normalize_short_date_full_month_name_day_year():
+    assert _normalize_short_date("August 14, 2026") == "14-Aug-2026"
+
+
+def test_normalize_short_date_unrecognized_shape_left_unchanged():
+    assert _normalize_short_date("Q3 2026") == "Q3 2026"
+    assert _normalize_short_date(None) is None
+    assert _normalize_short_date("") == ""
+
+
+def test_expiry_and_mfg_date_normalized_end_to_end_on_batch_detail_row_format():
+    from tests.pdf_builders import build_batch_detail_row_invoice_pdf_bytes
+
+    pdf_bytes = build_batch_detail_row_invoice_pdf_bytes()
+    _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
+    assert line_items[0].expiry_date == "Mar-2028"
+    assert line_items[0].mfg_date == "Apr-2026"

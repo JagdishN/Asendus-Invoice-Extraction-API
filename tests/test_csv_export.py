@@ -67,7 +67,10 @@ def test_files_are_actually_persisted_to_disk_with_matching_size_and_checksum():
         assert hashlib.sha256(content).hexdigest() == exported_file.sha256_checksum
 
 
-def test_csv_has_header_block_then_blank_row_then_line_items_table():
+def test_csv_is_the_line_items_table_only_no_header_block_no_blank_rows():
+    # Client-confirmed: no invoice/buyer header info in the CSV body at
+    # all, and no blank separator rows -- just the table's own header row
+    # followed immediately by one row per line item.
     job = _make_job()
     metadata = generate_and_persist_exports(job)
 
@@ -76,18 +79,15 @@ def test_csv_has_header_block_then_blank_row_then_line_items_table():
     content = export_storage.read_bytes(job.job_id, exported_file.filename)
     rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
 
-    assert rows[0] == ["Invoice Number", first_group.invoice_number]
-    assert rows[1][0] == "Source Pages"
+    assert [] not in rows  # no blank rows anywhere in the file
 
-    blank_row_index = next(i for i, row in enumerate(rows) if row == [])
-    header_row = rows[blank_row_index + 1]
+    header_row = rows[0]
     assert header_row[0] == "Line #"
     assert header_row[1] == "Item Description"
 
-    first_item_row = rows[blank_row_index + 2]
+    assert len(rows) == 1 + len(first_group.line_items)
+    first_item_row = rows[1]
     assert first_item_row[1] == first_group.line_items[0].item_description
-    # Header fields must not repeat on line-item rows (separate-header-block
-    # style, not flat/repeated).
     assert "Invoice Number" not in first_item_row
 
 
@@ -152,11 +152,10 @@ def test_build_invoice_csv_bytes_with_selected_fields_writes_only_those_columns(
     content = build_invoice_csv_bytes(group, ["line_number", "item_description", "taxable_value"])
     rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
 
-    blank_row_index = next(i for i, row in enumerate(rows) if row == [])
-    header_row = rows[blank_row_index + 1]
+    header_row = rows[0]
     assert header_row == ["Line #", "Item Description", "Taxable Value"]
 
-    first_item_row = rows[blank_row_index + 2]
+    first_item_row = rows[1]
     assert len(first_item_row) == 3
     assert first_item_row[1] == group.line_items[0].item_description
 
@@ -167,8 +166,7 @@ def test_build_invoice_csv_bytes_without_selected_fields_still_writes_every_colu
     content = build_invoice_csv_bytes(group)
     rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
 
-    blank_row_index = next(i for i, row in enumerate(rows) if row == [])
-    header_row = rows[blank_row_index + 1]
+    header_row = rows[0]
     assert len(header_row) == len(LINE_ITEM_EXPORT_COLUMNS)
 
 
@@ -200,5 +198,4 @@ def test_build_filtered_zip_bytes_contains_only_selected_columns_for_every_group
         for name in zf.namelist():
             content = zf.read(name)
             rows = list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))
-            blank_row_index = next(i for i, row in enumerate(rows) if row == [])
-            assert rows[blank_row_index + 1] == ["Line #", "Item Description"]
+            assert rows[0] == ["Line #", "Item Description"]

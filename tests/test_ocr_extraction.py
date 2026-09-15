@@ -61,6 +61,78 @@ def test_preprocess_converts_to_grayscale():
 
 
 # ---------------------------------------------------------------------------
+# Deskew -- pure opencv/PIL logic, no tesseract call. Uses a synthetic image
+# with several horizontal ruled lines (stand-ins for table rules/text
+# baselines) rather than a real invoice photo, so the test is deterministic
+# and doesn't depend on any real sample file being present.
+# ---------------------------------------------------------------------------
+
+
+def _build_ruled_lines_image(width: int = 800, height: int = 600, num_lines: int = 10):
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (width, height), color="white")
+    draw = ImageDraw.Draw(image)
+    for i in range(num_lines):
+        y = int(height * (i + 1) / (num_lines + 1))
+        draw.line([(width * 0.1, y), (width * 0.9, y)], fill="black", width=3)
+    return image
+
+
+def _measure_dominant_line_angle(image) -> float | None:
+    import cv2
+    import numpy as np
+
+    gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=100, minLineLength=gray.shape[1] // 4, maxLineGap=20)
+    if lines is None:
+        return None
+    angles = [
+        float(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+        for x1, y1, x2, y2 in lines.reshape(-1, 4)
+        if abs(np.degrees(np.arctan2(y2 - y1, x2 - x1))) <= 15
+    ]
+    return float(np.median(angles)) if angles else None
+
+
+def test_deskew_corrects_a_rotated_ruled_lines_image():
+    from app.services.ocr_extraction import _deskew_image
+
+    tilted = _build_ruled_lines_image().rotate(5, expand=False, fillcolor=(255, 255, 255))
+    before = _measure_dominant_line_angle(tilted)
+    assert before is not None and abs(before) > 2  # confirm the fixture really is tilted
+
+    corrected = _deskew_image(tilted)
+    after = _measure_dominant_line_angle(corrected)
+    assert after is not None
+    assert abs(after) < abs(before)
+    assert abs(after) < 1.5
+
+
+def test_deskew_leaves_an_already_upright_image_unchanged():
+    import numpy as np
+
+    from app.services.ocr_extraction import _deskew_image
+
+    upright = _build_ruled_lines_image()
+    corrected = _deskew_image(upright)
+    diff = np.array(upright.convert("RGB")).astype(int) - np.array(corrected.convert("RGB")).astype(int)
+    assert int(np.abs(diff).max()) == 0
+
+
+def test_deskew_falls_back_to_original_on_a_blank_image_with_no_lines():
+    from PIL import Image
+
+    from app.services.ocr_extraction import _deskew_image
+
+    blank = Image.new("RGB", (200, 200), color="white")
+    result = _deskew_image(blank)
+    assert result.size == blank.size
+    assert list(result.getdata()) == list(blank.getdata())
+
+
+# ---------------------------------------------------------------------------
 # Real OCR calls -- need the tesseract binary.
 # ---------------------------------------------------------------------------
 

@@ -35,8 +35,8 @@ Reading order for tabular/form-style invoices (accuracy pass):
     does not know about ruled table lines, and a row that's visually
     ambiguous (e.g. two adjacent narrow columns with similar row spacing)
     can still merge or split wrong. See preprocess_image_for_ocr and
-    DEFAULT_PSM for the other two accuracy levers (resolution, page
-    segmentation mode).
+    DEFAULT_PSM for the other accuracy levers (deskew, resolution/sharpening,
+    page segmentation mode).
 
 KNOWN LIMITATION -- line items and the tax-bracket summary table are NOT
 extracted from OCR text. Both of those, for native PDFs, come from
@@ -64,8 +64,10 @@ import logging
 import os
 import shutil
 
+import cv2
+import numpy as np
 import pytesseract
-from PIL import Image, ImageEnhance
+from PIL import Image, ImageEnhance, ImageFilter
 from pytesseract import Output
 
 from app.core.config import settings
@@ -92,14 +94,8 @@ logger = logging.getLogger(__name__)
 # render_page_to_image_bytes() uses this same default for PDF pages.
 DEFAULT_RENDER_DPI = 200
 
-# "Assume a single uniform block of text" -- tends to behave better than
-# Tesseract's own default (3, full-page automatic segmentation with
-# orientation/script detection) on a dense, form-style invoice, which is
-# not laid out like a paragraph of prose. Override via OCR_PSM env var
-# (see app/core/config.py) to try 4 (single column of variable-size text)
-# or 11/12 (sparse text, no particular order) against a real sample if 6
-# doesn't hold up -- NOT validated against a real invoice yet, just the
-# commonly-recommended starting point for form/receipt-style text.
+# See app/core/config.py's ocr_psm for the measured comparison behind
+# this default (4, "single column of variable-size text").
 DEFAULT_PSM = settings.ocr_psm
 
 _WINDOWS_DEFAULT_TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -132,12 +128,113 @@ _ASSUMED_PAGE_WIDTH_INCHES = 8.5
 _TARGET_EFFECTIVE_DPI = 300
 _MAX_UPSCALE_FACTOR = 3.0
 
+# Skew below this is noise (JPEG/photo capture jitter, not a real tilt) --
+# correcting it would just add rotation-interpolation blur for no benefit.
+# Above this, distrust the detection: a real hand-photographed invoice is
+# typically tilted a few degrees, not tens of degrees, so a larger reading
+# more likely means the line-detection picked up something that isn't
+# actually page/text tilt (a diagonal fold shadow, a stray mark) --
+# rotating on that basis would make a merely-tilted photo worse, not
+# better.
+_MIN_DESKEW_ANGLE_DEGREES = 0.5
+_MAX_DESKEW_ANGLE_DEGREES = 15.0
+
+# Only near-horizontal detected lines are treated as candidate evidence of
+# page tilt (table rules, ruled lines, text baselines) -- a genuinely
+# vertical or steeply-angled line is more likely a column divider, a
+# staple/fold shadow, or unrelated photo content, not something a
+# correctly-oriented invoice photo has many of.
+_HOUGH_ANGLE_TOLERANCE_DEGREES = 15.0
+
+# Below this many candidate lines, there isn't enough agreement to trust a
+# single median angle -- e.g. a mostly-blank, very sparse, or corrupt
+# image -- so skip deskewing rather than rotate based on one or two lines
+# that might not represent the page's real orientation at all.
+_MIN_HOUGH_LINES_FOR_DESKEW = 8
+
 
 def _estimate_effective_dpi(image: Image.Image) -> float:
     dpi_metadata = image.info.get("dpi")
     if dpi_metadata and dpi_metadata[0]:
         return float(dpi_metadata[0])
     return image.width / _ASSUMED_PAGE_WIDTH_INCHES
+
+
+def _deskew_image(image: Image.Image) -> Image.Image:
+    """
+    Corrects small ROTATIONAL skew -- the image's content is tilted a few
+    degrees, the common case for a hand-photographed (rather than flatbed-
+    scanned) invoice -- via Hough line detection: find straight edge
+    segments (Canny + HoughLinesP), keep the ones close to horizontal
+    (table rules, ruled lines, text baselines -- see
+    _HOUGH_ANGLE_TOLERANCE_DEGREES), and rotate by their median angle.
+
+    An earlier version of this function used cv2.minAreaRect over the
+    whole thresholded "ink" mask instead of Hough lines. Measured directly
+    against the real test photos this was built for: it degenerates to a
+    ~0-degree reading whenever ink pixels are scattered across most of the
+    frame (dense text + handwritten margin notes + a decorative border --
+    exactly what real invoice photos look like), because the minimum-area
+    rectangle around a near-full-frame scattered mask just comes out
+    axis-aligned regardless of the actual visual tilt. Hough line detection
+    instead measures the angle of concrete straight features and was
+    verified (via a synthetic known-angle rotation test against a real
+    sample image) to correctly recover a 3-6 degree induced tilt down to
+    under 1 degree residual -- the minAreaRect version recovered nothing.
+
+    Deliberately does NOT attempt full 4-corner perspective/keystone
+    correction (detecting the document's four physical corners and warping
+    them into a rectangle, the "phone document scanner" effect) -- that
+    needs a page boundary reliably distinguishable from its background,
+    which a real test photo (invoice paper cropped tight in frame,
+    similar-toned surface, folds/creases) doesn't reliably offer. A wrong
+    4-corner guess warps the image into something worse than just leaving
+    it tilted; a wrong rotation angle in this simpler approach at worst
+    leaves it tilted by roughly the same amount it already was.
+
+    Every failure mode here (no/too few candidate lines, an out-of-range
+    angle, any cv2 error) falls back to returning the original image
+    unchanged and logs at DEBUG rather than raising -- this is a best-
+    effort accuracy improvement layered in front of OCR, not a step that's
+    allowed to turn a previously-working image into a worse one, or to
+    take down the OCR call it precedes.
+    """
+    try:
+        gray = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        min_line_length = gray.shape[1] // 4
+        lines = cv2.HoughLinesP(
+            edges, 1, np.pi / 180, threshold=100, minLineLength=min_line_length, maxLineGap=20
+        )
+        if lines is None:
+            return image
+
+        candidate_angles = []
+        for x1, y1, x2, y2 in lines.reshape(-1, 4):
+            line_angle = float(np.degrees(np.arctan2(y2 - y1, x2 - x1)))
+            if abs(line_angle) <= _HOUGH_ANGLE_TOLERANCE_DEGREES:
+                candidate_angles.append(line_angle)
+        if len(candidate_angles) < _MIN_HOUGH_LINES_FOR_DESKEW:
+            return image
+
+        angle = float(np.median(candidate_angles))
+        if abs(angle) < _MIN_DESKEW_ANGLE_DEGREES or abs(angle) > _MAX_DESKEW_ANGLE_DEGREES:
+            return image
+
+        height, width = gray.shape
+        rotation_matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
+        rotated = cv2.warpAffine(
+            np.array(image.convert("RGB")),
+            rotation_matrix,
+            (width, height),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        logger.debug("Deskewed image by %.2f degrees (%d candidate lines)", angle, len(candidate_angles))
+        return Image.fromarray(rotated)
+    except Exception:
+        logger.debug("Deskew step failed; using original image unchanged", exc_info=True)
+        return image
 
 
 def _upscale_if_low_resolution(image: Image.Image) -> Image.Image:
@@ -149,6 +246,13 @@ def _upscale_if_low_resolution(image: Image.Image) -> Image.Image:
     not a substitute for validating against real invoice photos of known
     size. Capped at _MAX_UPSCALE_FACTOR so a tiny/corrupt image doesn't
     get blown up to something absurd.
+
+    Lanczos resampling (the standard high-quality upscale filter) still
+    softens edges when it's manufacturing new pixels -- a mild unsharp
+    mask afterward counteracts that, so an upscaled image doesn't end up
+    with MORE pixels but SOFTER text edges than the original, which would
+    work against Tesseract's stroke-edge-driven character recognition
+    rather than for it.
     """
     effective_dpi = _estimate_effective_dpi(image)
     if effective_dpi >= _TARGET_EFFECTIVE_DPI:
@@ -159,14 +263,16 @@ def _upscale_if_low_resolution(image: Image.Image) -> Image.Image:
         "Upscaling image %sx%s -> %sx%s (estimated effective DPI %.0f, target %d)",
         image.width, image.height, new_size[0], new_size[1], effective_dpi, _TARGET_EFFECTIVE_DPI,
     )
-    return image.resize(new_size, Image.LANCZOS)
+    resized = image.resize(new_size, Image.LANCZOS)
+    return resized.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
 
 
 def preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
     """
-    OCR accuracy preprocessing: upscale if the image is low-resolution,
-    convert to grayscale, boost contrast -- kept isolated from the OCR call
-    itself so it's easy to tune later without touching
+    OCR accuracy preprocessing pipeline: deskew if the content is
+    rotationally tilted, upscale (with a sharpening pass) if the image is
+    low-resolution, convert to grayscale, boost contrast -- kept isolated
+    from the OCR call itself so it's easy to tune later without touching
     extract_text_from_image_bytes.
 
     Deliberately does NOT also apply a fixed-threshold binarization step,
@@ -178,13 +284,53 @@ def preprocess_image_for_ocr(image: Image.Image) -> Image.Image:
     threshold with no adaptive/lighting-aware component apparently costs
     more than it buys on top of the contrast boost already here. Left out
     rather than shipped on unverified assumption; worth retrying with
-    adaptive/Otsu thresholding (needs numpy) specifically against a real
+    adaptive/Otsu thresholding specifically against a real
     scanned/photographed invoice, where uneven lighting is more likely to
     be the dominant problem than it is on a clean synthetic test image.
+    (_deskew_image above already pulls in the Otsu-thresholding building
+    block this would need, via opencv -- see that function if revisiting.)
     """
-    upscaled = _upscale_if_low_resolution(image)
+    deskewed = _deskew_image(image)
+    upscaled = _upscale_if_low_resolution(deskewed)
     grayscale = upscaled.convert("L")
     return ImageEnhance.Contrast(grayscale).enhance(2.0)
+
+
+# A horizontal gap at least this many times a row's own word height marks
+# a column boundary WITHIN that row -- splitting one Y-clustered row into
+# left-to-right column segments (mirrors spatial_text.
+# split_row_into_column_segments's role for the native-PDF path) so a
+# same-line label:value search (_search_labeled_value is deliberately
+# same-line-only) can't cross from one form column into an unrelated
+# neighboring one just because row-clustering put them on the same visual
+# row. Real invoices routinely lay several side-by-side blocks on one row
+# -- e.g. "Details of Receiver (Billed to)" next to "Details of Consignee
+# (Shiped to)", or an "Invoice No./Order No./Ref No." block next to an
+# "Invoice Date/Order Date/Ref Date" block -- and without this, a label's
+# same-row value search can grab a neighboring column's text instead of
+# (or in addition to) its own value, or find nothing at all if the real
+# value ends up several unrelated words away on the joined line. Scaled
+# by word height (not a fixed pixel value), since OCR coordinates are in
+# PIXELS at whatever resolution/upscale factor applies to a given image,
+# unlike the native-PDF path's fixed-point coordinate space. FRAGILE: not
+# validated against a range of real invoice photos yet -- too small and
+# normal word-to-word spacing within one column fragments; too large and
+# genuinely separate side-by-side form columns stay merged.
+_COLUMN_GAP_HEIGHT_RATIO = 6.0
+
+
+def _split_row_into_column_segments(row: list[dict]) -> list[list[dict]]:
+    words_sorted = sorted(row, key=lambda w: w["left"])
+    segments: list[list[dict]] = [[words_sorted[0]]]
+    for word in words_sorted[1:]:
+        prev = segments[-1][-1]
+        prev_right = prev["left"] + prev["width"]
+        gap_threshold = max(prev["height"], word["height"]) * _COLUMN_GAP_HEIGHT_RATIO
+        if word["left"] - prev_right > gap_threshold:
+            segments.append([word])
+        else:
+            segments[-1].append(word)
+    return segments
 
 
 def _group_words_into_rows(ocr_data: dict, row_tolerance_ratio: float = 0.6) -> list[str]:
@@ -195,10 +341,12 @@ def _group_words_into_rows(ocr_data: dict, row_tolerance_ratio: float = 0.6) -> 
     fragment a single visual row across multiple "lines" (or merge
     unrelated ones), which is exactly the failure mode that breaks
     label-matching on tabular invoices. Words are clustered purely by
-    vertical (top) proximity, in top-to-bottom scan order, then each row is
-    joined left-to-right by horizontal (left) position -- reconstructing
-    "words that are visually near each other on the same row" rather than
-    trusting Tesseract's read order.
+    vertical (top) proximity, in top-to-bottom scan order; each Y-cluster
+    is then split into left-to-right COLUMN segments wherever a large
+    horizontal gap suggests a different form column rather than the same
+    one (_split_row_into_column_segments) -- each segment becomes its own
+    output line, rather than joining the whole Y-cluster into one line
+    regardless of how many unrelated side-by-side blocks it spans.
 
     row_tolerance_ratio: how close two words' vertical centers need to be
     (relative to word height) to count as "the same row". FRAGILE: a fixed
@@ -224,6 +372,7 @@ def _group_words_into_rows(ocr_data: dict, row_tolerance_ratio: float = 0.6) -> 
                 "text": text,
                 "top": ocr_data["top"][i],
                 "left": ocr_data["left"][i],
+                "width": ocr_data["width"][i],
                 "height": max(ocr_data["height"][i], 1),
             }
         )
@@ -244,7 +393,11 @@ def _group_words_into_rows(ocr_data: dict, row_tolerance_ratio: float = 0.6) -> 
             rows.append([word])
             row_running_top = float(word["top"])
 
-    return [" ".join(w["text"] for w in sorted(row, key=lambda w: w["left"])) for row in rows]
+    lines: list[str] = []
+    for row in rows:
+        for segment in _split_row_into_column_segments(row):
+            lines.append(" ".join(w["text"] for w in sorted(segment, key=lambda w: w["left"])))
+    return lines
 
 
 def extract_text_from_image_bytes(image_bytes: bytes, psm: int = DEFAULT_PSM) -> str:
