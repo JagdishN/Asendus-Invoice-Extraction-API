@@ -88,6 +88,23 @@ class InvoiceLineItem(BaseModel):
     quantity_sold: Optional[float] = None
     quantity_free: Optional[float] = None
     quantity_total: Optional[float] = None
+    # Derived, NOT directly extracted from the invoice -- client-confirmed
+    # formula: the billed ("original") quantity is recovered by dividing
+    # taxable_value back by rate_pts (PTS -- Price To Stockist, NOT ptr/
+    # Price To Retailer; verified against a real invoice whose printed
+    # Sold quantities only reconcile against rate_pts, not ptr), and
+    # whatever's left out of the line's total quantity is free/bonus
+    # stock. The "total quantity" here isn't always the plain `quantity`
+    # field -- a format that splits Sold/Free into their own sub-columns
+    # (quantity_sold/quantity_free above) instead of one bundled number
+    # still needs this computed, so it falls back through quantity ->
+    # quantity_total -> quantity_sold+quantity_free. See
+    # native_pdf_extraction.py's _compute_pts_derived_quantities/
+    # _resolve_line_item_quantity for the exact computation. "Dynamic"
+    # columns: only populated when a usable quantity, taxable_value, AND
+    # rate_pts are present on this line, None otherwise.
+    pts_original_quantity: Optional[float] = None
+    pts_free_quantity: Optional[float] = None
     uom: Optional[str] = None
     unit_rate: Optional[float] = None
     mrp: Optional[float] = None  # Maximum Retail Price (regulatory ceiling price)

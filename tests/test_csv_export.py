@@ -125,6 +125,12 @@ def test_line_item_export_columns_includes_pack_and_matches_csv_order():
     assert labels["item_description"] == "Item Description"
 
 
+def test_line_item_export_columns_includes_pts_derived_quantity_columns():
+    labels = {c["field_name"]: c["label"] for c in LINE_ITEM_EXPORT_COLUMNS}
+    assert labels["pts_original_quantity"] == "Original Quantity"
+    assert labels["pts_free_quantity"] == "Free Quantity"
+
+
 def test_resolve_selected_line_item_fields_none_or_empty_means_no_filter():
     assert resolve_selected_line_item_fields(None) is None
     assert resolve_selected_line_item_fields([]) is None

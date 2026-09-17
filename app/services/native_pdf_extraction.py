@@ -1250,6 +1250,70 @@ def _normalize_short_date(raw: str | None) -> str | None:
     return raw
 
 
+def _resolve_line_item_quantity(item: InvoiceLineItem) -> float | None:
+    """
+    _compute_pts_derived_quantities needs ONE "total quantity for this
+    line" number, but which field actually holds that varies by format:
+    a single bundled `quantity` column (the original spec'd case), OR a
+    Sold/Free/Total sub-column split (quantity_sold/quantity_free/
+    quantity_total -- see their own comment in schemas.py) that leaves
+    `quantity` itself None. Confirmed against a real invoice using the
+    split format where quantity_total ALSO comes back None (that
+    particular column layout's own "Total" sub-header isn't currently
+    captured as quantity_total at all) -- quantity_sold/quantity_free are
+    the only reliable source there, so this falls back through:
+    quantity -> quantity_total -> quantity_sold + quantity_free (treating
+    a missing one of that pair as 0, since a row in the split-row format
+    is entirely a "sold" row or a "free" row, never both). Returns None
+    only when NONE of these give any information at all.
+    """
+    if item.quantity is not None:
+        return item.quantity
+    if item.quantity_total is not None:
+        return item.quantity_total
+    if item.quantity_sold is not None or item.quantity_free is not None:
+        return (item.quantity_sold or 0.0) + (item.quantity_free or 0.0)
+    return None
+
+
+def _compute_pts_derived_quantities(item: InvoiceLineItem) -> tuple[float | None, float | None]:
+    """
+    Client-confirmed formula for bills that carry a PTS (Price To
+    Stockist, the `rate_pts` field) rate. Reasoning: taxable_value is the
+    billed amount, so dividing it back by the per-unit PTS rate recovers
+    how many units were actually BILLED ("original" quantity); whatever's
+    left out of the line's total quantity (see _resolve_line_item_quantity
+    -- not always the plain `quantity` field) is free/bonus stock that
+    wasn't billed.
+
+        original = round(taxable_value / rate_pts)
+        free = total_quantity - original
+
+    Confirmed example: quantity=320, taxable_value=20044.8, rate_pts=69.6
+    -> original=288, free=32 (320-288). Also verified against a real
+    invoice with an explicit Sold/Free split (so the correct answer is
+    independently known): Sold=50, taxable_value=14811.50, rate_pts=296.23
+    -> original=round(14811.50/296.23)=50, matching Sold exactly -- ptr
+    (329.14) does NOT reconcile here (gives 45), which is why this uses
+    rate_pts specifically, not ptr.
+
+    Only computed when a usable quantity (see _resolve_line_item_quantity)
+    /taxable_value/rate_pts are ALL present and rate_pts is non-zero
+    (guards the division) -- these are "dynamic" columns, meant to stay
+    None on every line/invoice that doesn't actually carry a PTS rate, not
+    just default to 0. Deliberately does NOT clamp a negative `free`
+    (original > quantity, i.e. the numbers on this particular line don't
+    reconcile) to 0 -- surfacing that inconsistency as-is is more useful
+    than silently hiding it.
+    """
+    quantity = _resolve_line_item_quantity(item)
+    if quantity is None or item.taxable_value is None or not item.rate_pts:
+        return None, None
+    original = round(item.taxable_value / item.rate_pts)
+    free = quantity - original
+    return float(original), float(free)
+
+
 # A row with a real, non-empty description cell and a real-looking number in
 # one of the amount columns is otherwise indistinguishable from a genuine
 # line item by column position alone -- but a running "Total for <brand>"/
@@ -2443,5 +2507,6 @@ def extract_invoice_group_fields(
             item.item_description, item.pack = _split_description_and_pack(item.item_description)
         item.expiry_date = _normalize_short_date(item.expiry_date)
         item.mfg_date = _normalize_short_date(item.mfg_date)
+        item.pts_original_quantity, item.pts_free_quantity = _compute_pts_derived_quantities(item)
 
     return header_fields, header_field_confidences, line_items

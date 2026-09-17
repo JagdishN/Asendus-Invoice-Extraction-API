@@ -1,7 +1,8 @@
-from app.models.schemas import ConfidenceBand
+from app.models.schemas import ConfidenceBand, InvoiceLineItem
 from app.services.invoice_grouping import group_pages_into_invoices
 from app.services.native_pdf_extraction import (
     INVOICE_TOTAL_LABELS,
+    _compute_pts_derived_quantities,
     _extract_amount_field,
     _extract_invoice_number,
     _normalize_short_date,
@@ -259,3 +260,107 @@ def test_expiry_and_mfg_date_normalized_end_to_end_on_batch_detail_row_format():
     _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
     assert line_items[0].expiry_date == "Mar-2028"
     assert line_items[0].mfg_date == "Apr-2026"
+
+
+# ---------------------------------------------------------------------------
+# PTS-derived Original Quantity / Free Quantity (client-confirmed formula:
+# original = round(taxable_value / rate_pts), free = total_quantity -
+# original -- "dynamic" columns, populated only when a bill actually
+# carries a PTS rate). NOTE: an intermediate version of this used `ptr`
+# (Price To Retailer, a DIFFERENT column) as the divisor -- verified
+# against a real invoice with an already-known correct answer (explicit
+# Sold/Free columns) that PTS reconciles and PTR does not, so this was
+# corrected back to `rate_pts`.
+# ---------------------------------------------------------------------------
+
+
+def _line_item(**overrides) -> InvoiceLineItem:
+    defaults = dict(line_number=1, item_description="Test Product")
+    defaults.update(overrides)
+    return InvoiceLineItem(**defaults)
+
+
+def test_pts_derived_quantities_confirmed_example():
+    # quantity=320, taxable_value=20044.8, rate_pts=69.6 -> original=288,
+    # free=32 (69.6 * 288 == 20044.8 exactly).
+    item = _line_item(quantity=320.0, taxable_value=20044.8, rate_pts=69.6)
+    original, free = _compute_pts_derived_quantities(item)
+    assert original == 288.0
+    assert free == 32.0
+
+
+def test_pts_derived_quantities_rounds_to_nearest_whole_unit():
+    # 2400 / 69.6 = 34.48... -> rounds to 34, free = 320 - 34 = 286.
+    item = _line_item(quantity=320.0, taxable_value=2400.0, rate_pts=69.6)
+    original, free = _compute_pts_derived_quantities(item)
+    assert original == 34.0
+    assert free == 286.0
+
+
+def test_pts_derived_quantities_none_when_rate_pts_missing():
+    item = _line_item(quantity=320.0, taxable_value=20044.8, rate_pts=None)
+    assert _compute_pts_derived_quantities(item) == (None, None)
+
+
+def test_pts_derived_quantities_none_when_rate_pts_is_zero():
+    item = _line_item(quantity=320.0, taxable_value=20044.8, rate_pts=0.0)
+    assert _compute_pts_derived_quantities(item) == (None, None)
+
+
+def test_pts_derived_quantities_none_when_quantity_or_taxable_value_missing():
+    assert _compute_pts_derived_quantities(_line_item(taxable_value=20044.8, rate_pts=69.6)) == (None, None)
+    assert _compute_pts_derived_quantities(_line_item(quantity=320.0, rate_pts=69.6)) == (None, None)
+
+
+def test_pts_derived_quantities_falls_back_to_quantity_sold_plus_free_when_no_bundled_quantity():
+    # Real invoice format: quantity/quantity_total both None, only
+    # quantity_sold/quantity_free are populated (the Sold/Free-as-separate-
+    # rows format) -- verified real numbers: Sold=50, taxable_value=
+    # 14811.50, rate_pts=296.23 -> original=round(14811.50/296.23)=50,
+    # matching Sold exactly; free = (50+0) - 50 = 0.
+    item = _line_item(quantity_sold=50.0, quantity_free=0.0, taxable_value=14811.50, rate_pts=296.23)
+    original, free = _compute_pts_derived_quantities(item)
+    assert original == 50.0
+    assert free == 0.0
+
+
+def test_pts_derived_quantities_falls_back_to_quantity_total_when_bundled_quantity_missing():
+    item = _line_item(quantity_total=320.0, taxable_value=20044.8, rate_pts=69.6)
+    original, free = _compute_pts_derived_quantities(item)
+    assert original == 288.0
+    assert free == 32.0
+
+
+def test_pts_derived_quantities_computed_end_to_end_via_extract_invoice_group_fields():
+    from tests.pdf_builders import build_ambiguous_column_headers_pdf_bytes
+
+    # This fixture's single line item: Qty=10, Taxable=760.00, Pts=70.00 ->
+    # original = round(760/70) = 11, free = 10 - 11 = -1 (not clamped --
+    # this fixture's own numbers just don't happen to reconcile, which is
+    # exactly the "surface it, don't hide it" behavior being tested).
+    pdf_bytes = build_ambiguous_column_headers_pdf_bytes()
+    _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
+
+    assert line_items[0].rate_pts == 70.0
+    assert line_items[0].pts_original_quantity == 11.0
+    assert line_items[0].pts_free_quantity == -1.0
+
+
+def test_pts_derived_quantities_computed_end_to_end_for_sold_free_split_format():
+    # Mirrors the real invoice's Sold/Free-as-separate-rows layout via the
+    # pharma builder: Sold row has sold=50, taxable=14811.50, rate_pts=
+    # 296.23 -> original=50, free=0 (matching the real invoice exactly).
+    line_item = dict(
+        sr=1, description="Nefrosave Forte Tablets -15s", hsn="30049099", batch="P0527", expiry="05/2028",
+        sold=50, free="", total_qty=50, mrp="432.00", ptr="329.14", rate_pts="296.23",
+        total_amt="14811.50", discount="", taxable="14811.50",
+        cgst_rate="2.50%", cgst_amt="370.29", sgst_rate="2.50%", sgst_amt="370.29",
+        igst_rate="", igst_amt="",
+    )
+    pdf_bytes = build_pharma_invoice_pdf_bytes(line_items=[line_item])
+    _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
+
+    assert line_items[0].quantity_sold == 50.0
+    assert line_items[0].rate_pts == 296.23
+    assert line_items[0].pts_original_quantity == 50.0
+    assert line_items[0].pts_free_quantity == 0.0

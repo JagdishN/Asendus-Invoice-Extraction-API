@@ -52,6 +52,8 @@ _LINE_ITEM_COLUMN_LABELS = {
     "quantity_sold": "Qty Sold",
     "quantity_free": "Qty Free",
     "quantity_total": "Qty Total",
+    "pts_original_quantity": "Original Quantity",
+    "pts_free_quantity": "Free Quantity",
     "uom": "UOM",
     "unit_rate": "Unit Rate",
     "mrp": "MRP",
