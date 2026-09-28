@@ -684,6 +684,17 @@ _LINE_ITEM_TABLE_HARD_STOP_PATTERNS = [
     r"dr\s*/\s*cr",
     r"auto\s*adjustment",
     r"warranty\s*:",
+    # Pharma-distributor invoices commonly print a manufacturer-plant-code
+    # legend right after the line-items table (e.g. "STPL SOFTESULE
+    # PRIVATE LIMITED ; SHIV SHIVA BIOGENETIC ; ...", explaining the short
+    # codes used in the table's own manufacturer column) -- confirmed real
+    # invoice (Indoco Remedies Ltd) where this legend's own text fell
+    # inside the stale column boundaries by X-coincidence and was emitted
+    # as several fake trailing line items, one of which even picked up a
+    # stray page-footer number ("Time: 11:01:01") as a fake PTR value.
+    r"manufacturing\s*address",
+    r"remarks\s*:",
+    r"instruction\s*to\s*customer",
 ]
 
 # --- Value shape patterns, per field type -------------------------------
@@ -695,13 +706,21 @@ _GSTIN_VALUE = r"[0-9A-Za-z]{10,15}"
 # realistically signed (a credit/reduction reads as a negative figure).
 _AMOUNT_VALUE = r"-?[₹$]?\s?[0-9][0-9,]*\.?[0-9]*"
 _LINE_TEXT_VALUE = r"[^\n]{2,80}"
-# IRN capture is deliberately broad (10-70 chars, alnum plus the same
+# IRN capture is deliberately broad (5-70 chars, alnum plus the same
 # separator chars generic invoice numbers use) -- _looks_like_irn grades
 # HIGH vs REVIEW separately, so this just needs to capture whatever token
 # follows the label without truncating a real 64-char hex IRN, while still
 # capturing non-hex/generic invoice numbers (e.g. "INV/2026/001") so they
 # still get graded REVIEW rather than silently coming back as None.
-_IRN_VALUE = r"[0-9A-Za-z][0-9A-Za-z\/\-\.]{9,69}"
+# CONFIRMED REAL BUG: this was previously 10-70 chars, which rejected a
+# real invoice whose OWN invoice number is a plain 9-digit number
+# ("369377796") outright -- the same-line label:value match failed
+# entirely (value too short to match), so the spatial fallback took over
+# and picked up a coincidentally-10-character nearby DATE instead
+# ("12.03.2025"). Lowered to 5 as a balance: short enough to admit a real
+# 9-digit invoice number, long enough that a short unrelated token (a
+# 2-digit state code, a percentage like "2.50") still doesn't qualify.
+_IRN_VALUE = r"[0-9A-Za-z][0-9A-Za-z\/\-\.]{4,69}"
 _NUMERIC_CODE_VALUE = r"[0-9]{6,20}"
 # Same shape as _IRN_VALUE, but requires at least one digit somewhere in
 # the token (lookahead). Used ONLY by the spatial (nearby-row) fallback,
@@ -712,7 +731,7 @@ _NUMERIC_CODE_VALUE = r"[0-9]{6,20}"
 # same-row-less IRN search grabbed a word out of the vendor's own name a
 # few rows below the label. A generic invoice/IRN number realistically
 # always contains at least one digit; a bare word never does.
-_IRN_FALLBACK_VALUE = r"(?=[0-9A-Za-z\/\-\.]*[0-9])[0-9A-Za-z][0-9A-Za-z\/\-\.]{9,69}"
+_IRN_FALLBACK_VALUE = r"(?=[0-9A-Za-z\/\-\.]*[0-9])[0-9A-Za-z][0-9A-Za-z\/\-\.]{4,69}"
 
 
 def _search_labeled_value(text: str, label_patterns: list[str], value_pattern: str) -> str | None:
@@ -1018,13 +1037,29 @@ _LINE_ITEM_COLUMN_KEYWORDS: dict[str, list[str]] = {
     # superseded old value is deliberately not kept, only recognized so it
     # can't steal the slot from the current one.
     "mrp_old": ["old mrp"],
-    "mrp": ["new mrp", "mrp"],
-    "ptr": ["ptr"],
-    # "pts" (no "rate"/"points" wording at all) confirmed against a real
-    # invoice that pairs a bare "PTR"/"PTS" column -- Price To Stockist,
-    # the standard pharma-distribution counterpart to PTR (Price To
-    # Retailer). See rate_pts's comment in schemas.py.
-    "rate_pts": ["rate pts", "rate points", "pts"],
+    # "m.r.p." confirmed against a real invoice (Indoco Remedies Ltd) that
+    # writes this abbreviation WITH periods -- same class of gap as
+    # "p.t.r"/"p.t.s" below (plain "mrp" is not a substring of "m.r.p.").
+    "mrp": ["new mrp", "mrp", "m.r.p."],
+    # "p.t.r" confirmed against a real invoice (Mankind Pharma Ltd) that
+    # writes this abbreviation WITH periods ("P.T.R") -- plain "ptr" is not
+    # a substring of "p.t.r", so this needed its own keyword rather than
+    # relying on the unpunctuated one.
+    "ptr": ["ptr", "p.t.r"],
+    # "pts"/"p.t.s" (no "rate"/"points" wording at all) confirmed against
+    # real invoices that pair a bare "PTR"/"PTS" or "P.T.R"/"P.T.S" column
+    # -- Price To Stockist, the standard pharma-distribution counterpart to
+    # PTR (Price To Retailer). See rate_pts's comment in schemas.py.
+    "rate_pts": ["rate pts", "rate points", "pts", "p.t.s"],
+    # Checked BEFORE discount_amount and uom -- client-confirmed: when a
+    # bill has no PTS column, a "Disc Price"/"Unit Price"/"Unit Rate"
+    # column stands in for it (see schemas.py's pts_original_quantity
+    # comment / _resolve_pts_divisor). Without this ordering, "Disc Price"
+    # falls through to discount_amount's own bare "disc" substring, and
+    # "Unit Price"/"Unit Rate" fall through to uom's bare "unit" substring
+    # below -- both real bugs confirmed live (neither ever reaching
+    # unit_rate at all, silently breaking the PTS-fallback calculation).
+    "unit_rate": ["rate", "price"],
     "discount_amount": ["disc amt", "discount amt", "discount", "disc"],
     "taxable_value": ["taxable"],
     # Longer/more specific phrasings listed BEFORE their shorter
@@ -1046,31 +1081,47 @@ _LINE_ITEM_COLUMN_KEYWORDS: dict[str, list[str]] = {
         "description",
         "particular",
         "item",
+        # Bare "PRODUCT" (no "description"/"name" qualifier) confirmed
+        # against a real invoice (Indoco Remedies Ltd) -- without this, NO
+        # column mapped to item_description at all, and every row got
+        # silently skipped (a row with no item_description is treated as
+        # blank/not-a-real-item), losing the entire line-items table.
+        "product",
     ],
+    # A real, separate "Pack" column (e.g. "100 ML", "10S", "15 GMS") --
+    # confirmed against a real invoice (Indoco Remedies Ltd) distinct from
+    # the hyphen-suffix pack split (_split_description_and_pack) used when
+    # a format instead embeds it in the description itself (e.g.
+    # "Nefrosave Forte Tablets -15s"). Whichever sets `pack` first wins --
+    # see schemas.py's InvoiceLineItem.pack comment.
+    "pack": ["pack"],
     "hsn_sac": ["hsn", "sac"],
     "quantity": ["qty", "quantity"],
     "uom": ["uom", "unit"],
-    "unit_rate": ["rate", "price"],
     # "value" confirmed against a real invoice whose line-amount column is
     # titled bare "VALUE", not "Total" -- checked after taxable_value (see
     # above) already claims any "Taxable Value" cell first, so this can't
     # collide with it.
     "line_total": ["total", "value"],
-    # Not InvoiceLineItem fields -- see _INVOICE_LINE_ITEM_FIELD_NAMES.
+    # Not an InvoiceLineItem field -- see _INVOICE_LINE_ITEM_FIELD_NAMES.
     # Kept in this SAME configurable list (not a second one) purely so
-    # these columns still count toward header-match scoring/table
-    # selection and show up in diagnostics as recognized columns, even
-    # though their per-row values are never written to a line item.
+    # this column still counts toward header-match scoring/table
+    # selection and shows up in diagnostics as a recognized column, even
+    # though its per-row values are never written to a line item.
     "sr_no": ["sr no", "sr.no", "s.no", "sl no", "sl.no", "serial no", "serial number"],
-    # "manufacturer" additionally matters for the POSITIONAL parser's
-    # table-end detection, not just scoring: a real invoice's manufacturer
-    # column commonly wraps 2-3 lines -- giving it a real column boundary
-    # means a wrapped continuation line (e.g. just "LIMITED" on its own
-    # row) lands in a recognized column instead of nowhere, so it isn't
-    # mistaken for having left the table. See the "not any(field_name in
-    # _INVOICE_LINE_ITEM_FIELD_NAMES ...)" branch in
-    # _extract_line_items_positional.
-    "manufacturer": ["mfgr", "manufacturer", "mfg."],
+    # "mfrs" confirmed against a real invoice (Indoco Remedies Ltd) that
+    # abbreviates this column that way rather than "mfgr"/"manufacturer".
+    # Also matters for the POSITIONAL parser's table-end detection, not
+    # just scoring: a real invoice's manufacturer column commonly wraps
+    # 2-3 lines -- giving it a real column boundary means a wrapped
+    # continuation line (e.g. just "LIMITED" on its own row) lands in a
+    # recognized column instead of nowhere, so it isn't mistaken for
+    # having left the table.
+    # "mfg name" confirmed against a real invoice (Vishal Agencies,
+    # Hyderabad) that spells this column out fully rather than
+    # abbreviating -- listed as its own phrase (not bare "mfg") to avoid
+    # accidentally matching an unrelated "Mfg Date" column elsewhere.
+    "manufacturer": ["mfgr", "manufacturer", "mfg.", "mfrs", "mfg name"],
 }
 
 # _LINE_ITEM_COLUMN_KEYWORDS intentionally includes a few keys (currently
@@ -1081,6 +1132,17 @@ _LINE_ITEM_COLUMN_KEYWORDS: dict[str, list[str]] = {
 # skipped when actually building an InvoiceLineItem, in both
 # _extract_line_items_from_tables and _extract_line_items_positional.
 _INVOICE_LINE_ITEM_FIELD_NAMES = set(InvoiceLineItem.model_fields)
+
+# `manufacturer` is a real InvoiceLineItem field (see schemas.py) but is
+# ALSO commonly the only thing that lands in a recognized column on a
+# wrapped continuation line (its own column spanning 2-3 physical rows,
+# e.g. a second row with just "LIMITED" on it) -- excluded here so the
+# POSITIONAL parser's "is this row a genuine new line item" check (right
+# below) doesn't treat a manufacturer-only row as one. Real items on this
+# real invoice format DO have manufacturer on the SAME row as their own
+# description (e.g. "CYCLOPAM TAB 15X3X10S ... WALU ..."), so this only
+# ever matters for a row where manufacturer is the ONLY thing that matched.
+_ROW_CONTINUATION_PRONE_FIELDS = {"manufacturer"}
 
 _LINE_ITEM_NUMERIC_FIELDS = {
     "quantity",
@@ -1104,6 +1166,23 @@ _LINE_ITEM_NUMERIC_FIELDS = {
 }
 
 
+# Bare "Amount"/"Net Amount" headers (confirmed real invoice: Mankind
+# Pharma Ltd) are too generic for the substring-keyword system below: any
+# "amount"-containing keyword (e.g. "cgst amount") would need very
+# particular cross-field ordering to avoid a bare "amount" keyword also
+# matching "Net Amount" (which contains "amount" as a substring) and
+# stealing it from line_total, since taxable_value is deliberately checked
+# BEFORE line_total already (see "Taxable Value" vs bare "Value" comment
+# below). EXACT (trimmed, case-insensitive) match sidesteps that collision
+# entirely -- "amount" != "net amount" as full strings, even though one
+# contains the other -- so this is checked first, as its own pass, rather
+# than folded into the substring keyword lists.
+_EXACT_HEADER_TEXT_FIELDS: dict[str, str] = {
+    "amount": "taxable_value",
+    "net amount": "line_total",
+}
+
+
 def _map_table_header_columns(header_row: list[str | None]) -> dict[int, str]:
     """Maps column index -> canonical field name (see
     _LINE_ITEM_COLUMN_KEYWORDS/_INVOICE_LINE_ITEM_FIELD_NAMES -- not every
@@ -1114,6 +1193,10 @@ def _map_table_header_columns(header_row: list[str | None]) -> dict[int, str]:
         if not cell:
             continue
         cell_lower = cell.strip().lower()
+        exact_field = _EXACT_HEADER_TEXT_FIELDS.get(cell_lower)
+        if exact_field is not None and exact_field not in mapping.values():
+            mapping[idx] = exact_field
+            continue
         for field_name, keywords in _LINE_ITEM_COLUMN_KEYWORDS.items():
             if field_name in mapping.values():
                 continue
@@ -1121,6 +1204,76 @@ def _map_table_header_columns(header_row: list[str | None]) -> dict[int, str]:
                 mapping[idx] = field_name
                 break
     return mapping
+
+
+# --- Combined stacked-cell header columns ---------------------------------
+# Confirmed real invoice (Mankind Pharma Ltd "Discovery"/"Nobelis"
+# templates): several ruled-table columns print TWO distinct values
+# stacked in ONE cell, e.g. "Mfg Date/\nExp Date"'s data cells are
+# literally "<mfg date>\n<exp date>" -- not one date wrapped across two
+# lines, but two DIFFERENT dates in the same grid cell. PyMuPDF's
+# find_tables() preserves that embedded newline verbatim in both the
+# header AND data cells. The normal single-field-per-column model
+# (_map_table_header_columns + _normalize_cell_text, which COLLAPSES an
+# embedded newline to a space) can't represent "this one column is
+# actually two fields" -- confirmed real bug: expiry_date came out as the
+# garbled, unparseable "FEB-25 JAN-27" (both dates squashed together)
+# instead of either date alone, which is what prompted this.
+#
+# Scoped to only trigger when the HEADER CELL ITSELF is multi-line (a
+# strong, narrow signal PyMuPDF is reporting two genuinely stacked values,
+# not a single label that merely got word-wrapped for column width) --
+# every other confirmed format's headers are single-line, so this can't
+# affect them. Independent of _map_table_header_columns's global "each
+# field claimed by at most one column" bookkeeping, since these pairs only
+# ever co-occur on this one vendor template's own multi-line headers.
+_COMBINED_HEADER_LINE_PAIRS: list[tuple[str, str, str | None, str | None]] = [
+    # (line-0 keyword, line-1 keyword, field for line 0, field for line 1)
+    ("material", "hsn", None, "hsn_sac"),
+    ("mfg name", "batch", None, "batch_number"),
+    ("mfg date", "exp date", "mfg_date", "expiry_date"),
+    ("disc", "disc", "discount_amount", "discount_rate"),
+]
+
+
+def _map_combined_header_columns(header_row: list[str | None]) -> dict[int, tuple[str | None, str | None]]:
+    """
+    Detects columns whose header cell is itself multi-line and matches a
+    known real line0/line1 pattern (see module comment above). Returns
+    column_index -> (field_for_line_0_or_None, field_for_line_1_or_None).
+
+    "Amount/\\nCGST%" / "Amount/\\nSGST%" / "Amount/\\nIGST%" are handled
+    separately from the fixed pairs list above: which SPECIFIC tax the
+    generic first line ("Amount") means is only named on the second line,
+    so this can't be a fixed keyword pair the way e.g. "Mfg Date"/"Exp
+    Date" is.
+    """
+    combined: dict[int, tuple[str | None, str | None]] = {}
+    for idx, cell in enumerate(header_row):
+        if not cell or "\n" not in cell:
+            continue
+        lines = [line.strip().lower() for line in cell.split("\n") if line.strip()]
+        if len(lines) < 2:
+            continue
+        line0, line1 = lines[0], lines[1]
+
+        matched = False
+        for kw0, kw1, field0, field1 in _COMBINED_HEADER_LINE_PAIRS:
+            if kw0 in line0 and kw1 in line1:
+                combined[idx] = (field0, field1)
+                matched = True
+                break
+        if matched:
+            continue
+
+        if "amount" in line0:
+            if "cgst" in line1:
+                combined[idx] = ("cgst_amount", "cgst_rate")
+            elif "sgst" in line1:
+                combined[idx] = ("sgst_amount", "sgst_rate")
+            elif "igst" in line1:
+                combined[idx] = ("igst_amount", "igst_rate")
+    return combined
 
 
 def _normalize_cell_text(value: str) -> str:
@@ -1154,15 +1307,91 @@ def _split_description_and_pack(description: str) -> tuple[str, str | None]:
     return match.group(1).strip(), match.group(2).strip()
 
 
+# Confirmed real invoice (Vishal Agencies, Hyderabad): the item_description
+# CELL itself is two physical lines -- the product name, then a
+# "Pack Size: <size>" label:value line right below it (e.g. "CUDO FORTE\n
+# Pack Size: 1*10 CAPSULE") -- collapsed by _normalize_cell_text into one
+# space-joined string ("CUDO FORTE Pack Size: 1*10 CAPSULE") before this
+# runs. A THIRD, distinct pack-extraction rule alongside the hyphen-suffix
+# rule (_split_description_and_pack) and the batch-detail-row trailing-
+# number rule -- an explicit "Pack Size:" label is a much stronger,
+# unambiguous signal than either, so this is tried FIRST (see the
+# end-of-extraction loop in extract_invoice_group_fields).
+_PACK_SIZE_LABEL_RE = re.compile(r"^(?P<description>.*?)\s*pack\s*size\s*:\s*(?P<pack>.+)$", re.IGNORECASE)
+
+
+def _split_description_and_pack_size_label(description: str) -> tuple[str, str | None]:
+    match = _PACK_SIZE_LABEL_RE.match(description)
+    if match is None:
+        return description, None
+    return match.group("description").strip(), match.group("pack").strip()
+
+
+# A subset of _LINE_ITEM_NUMERIC_FIELDS worth checking for "does this row
+# have any real data at all" -- deliberately not the full set (e.g.
+# discount_rate/cess-style fields are routinely 0.00 on a genuine item
+# too, so their mere presence isn't as strong a signal either way; these
+# few are the ones a genuine product row essentially always has at least
+# one of).
+_LINE_ITEM_CORE_DATA_FIELDS = ("quantity", "mrp", "ptr", "rate_pts", "unit_rate", "taxable_value", "line_total")
+
+
+def _merge_page_split_description_only_rows(line_items: list[InvoiceLineItem]) -> list[InvoiceLineItem]:
+    """
+    Confirmed real bug (Vishal Agencies, Hyderabad, a 7-page invoice): a
+    product's name landed as the very LAST row on one page with nothing
+    else on it (the page's own table simply ran out of room after
+    printing the name), and the REST of that same product's row (HSN/
+    batch/pack/quantity/amounts...) printed as the FIRST row of the next
+    page -- with no name at all, since that already went out on the
+    previous page. Each page is parsed independently (see the per-page
+    positional-parser loop above, deliberate to keep page boilerplate
+    from bleeding across pages), so this produces TWO line items instead
+    of one: a stray, all-blank-except-description "item", immediately
+    followed by a real item missing its own description entirely.
+
+    Detects that specific adjacent pair -- a description-only row (no
+    core numeric data at all) directly followed by a row that DOES have
+    real data -- and merges the orphaned name into the following row's
+    description, dropping the stray row. Deliberately narrow (adjacency +
+    "no data at all" on the first row) so a genuinely sparse but real
+    line item elsewhere isn't merged away by mistake.
+    """
+    merged: list[InvoiceLineItem] = []
+    skip_next = False
+    for idx, item in enumerate(line_items):
+        if skip_next:
+            skip_next = False
+            continue
+        is_description_only = item.item_description and not any(
+            getattr(item, field_name) is not None for field_name in _LINE_ITEM_CORE_DATA_FIELDS
+        )
+        next_item = line_items[idx + 1] if idx + 1 < len(line_items) else None
+        next_has_real_data = next_item is not None and any(
+            getattr(next_item, field_name) is not None for field_name in _LINE_ITEM_CORE_DATA_FIELDS
+        )
+        if is_description_only and next_has_real_data:
+            next_item.item_description = f"{item.item_description} {next_item.item_description}".strip()
+            merged.append(next_item)
+            skip_next = True
+            continue
+        merged.append(item)
+
+    for line_number, item in enumerate(merged, start=1):
+        item.line_number = line_number
+    return merged
+
+
 # --- Line-item date normalization (expiry_date/mfg_date) -----------------
 # Client-confirmed: these must display in the short "DD-MMM-YYYY" form
-# (e.g. "01-Sep-2026") in the exported table. Pharma invoices routinely
-# print expiry/mfg as a whole MONTH only, with no day at all (confirmed
-# real raw shapes across formats already in this codebase: generic
-# find_tables()-based columns print e.g. "12/2027"; the batch-detail-row
-# format's own regex captures e.g. "MAR-2028") -- when there's no day in
-# the source, there's nothing to zero-pad into "DD-", so the output stays
-# "MMM-YYYY" rather than fabricating a day that was never printed.
+# (e.g. "01-Sep-2026") in the exported table, ALWAYS including a day.
+# Pharma invoices routinely print expiry/mfg as a whole MONTH only, with
+# no day at all (confirmed real raw shapes across formats already in this
+# codebase: generic find_tables()-based columns print e.g. "12/2027"; the
+# batch-detail-row format's own regex captures e.g. "MAR-2028") -- when
+# there's no day in the source, the day defaults to "01" (client-
+# confirmed) rather than leaving it out, so every value in this column is
+# a consistent DD-MMM-YYYY shape.
 # Applied as ONE shared post-processing pass (see the pack-split loop at
 # the end of extract_invoice_group_fields, same pattern) so every
 # extraction path gets identical formatting instead of each one needing
@@ -1180,7 +1409,8 @@ _MONTH_NAME_TO_NUMBER = {
 
 # Checked in this order: more specific (day present) patterns before their
 # day-less counterparts, so e.g. "01-MAR-2028" isn't left partially matched
-# by the day-less "MMM-YYYY" pattern.
+# by the day-less "MMM-YYYY" pattern (which now defaults the day to "01"
+# on a match, same as an explicit "01" would produce).
 _DATE_DAY_MONTH_YEAR_NUMERIC_RE = re.compile(r"^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$")
 _DATE_DAY_MONTHNAME_YEAR_RE = re.compile(r"^(\d{1,2})[\s\/\-]([A-Za-z]{3,9})[\s\/\-,]+(\d{2,4})$")
 _DATE_MONTHNAME_DAY_YEAR_RE = re.compile(r"^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{2,4})$")
@@ -1198,15 +1428,17 @@ def _normalize_date_year(raw_year: str) -> int:
 
 def _normalize_short_date(raw: str | None) -> str | None:
     """
-    Best-effort normalization to "DD-MMM-YYYY" (or "MMM-YYYY" when the
-    source has no day -- see module comment above). Recognizes the actual
-    raw shapes seen across this codebase's invoice formats: numeric
-    DD/MM/YYYY (day-first, matching the Indian-invoice convention already
-    assumed elsewhere in this module), numeric MM/YYYY, "DD-MMM-YYYY"/
-    "DD MMM YYYY", "MMM-YYYY"/"MMM/YYYY", and a full month name
-    ("August 14, 2026"). Falls back to returning the raw value completely
-    UNCHANGED for anything else -- consistent with this codebase's
-    "don't guess" philosophy: a date shape this doesn't recognize is
+    Best-effort normalization to "DD-MMM-YYYY", ALWAYS including a day --
+    client-confirmed: when the source has no day at all (see module
+    comment above), it defaults to "01" rather than being left out.
+    Recognizes the actual raw shapes seen across this codebase's invoice
+    formats: numeric DD/MM/YYYY (day-first, matching the Indian-invoice
+    convention already assumed elsewhere in this module), numeric MM/YYYY,
+    "DD-MMM-YYYY"/"DD MMM YYYY", "MMM-YYYY"/"MMM/YYYY" (defaults to day
+    "01"), and a full month name ("August 14, 2026"). Falls back to
+    returning the raw value completely UNCHANGED for anything else --
+    consistent with this codebase's "don't guess" philosophy: a date shape
+    this doesn't recognize is
     safer left as printed than silently mangled by a wrong guess.
     """
     if not raw:
@@ -1239,13 +1471,13 @@ def _normalize_short_date(raw: str | None) -> str | None:
     if match:
         month = _MONTH_NAME_TO_NUMBER.get(match.group(1).lower())
         if month:
-            return f"{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
+            return f"01-{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
 
     match = _DATE_MONTH_YEAR_NUMERIC_RE.match(value)
     if match:
         month = int(match.group(1))
         if 1 <= month <= 12:
-            return f"{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
+            return f"01-{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
 
     return raw
 
@@ -1276,17 +1508,31 @@ def _resolve_line_item_quantity(item: InvoiceLineItem) -> float | None:
     return None
 
 
+def _resolve_pts_divisor(item: InvoiceLineItem) -> float | None:
+    """
+    Client-confirmed fallback: when a bill has no PTS (rate_pts) column at
+    all, ANY of a Disc Price / Rate / Unit Price / Unit Rate column can
+    stand in for it for this same derivation -- all of those are captured
+    under the single generic `unit_rate` field already (see its "rate"/
+    "price" keywords in _LINE_ITEM_COLUMN_KEYWORDS), so this just needs to
+    fall back to it. rate_pts is preferred whenever it's actually present,
+    since it's the field this formula was originally confirmed against.
+    """
+    return item.rate_pts if item.rate_pts else item.unit_rate
+
+
 def _compute_pts_derived_quantities(item: InvoiceLineItem) -> tuple[float | None, float | None]:
     """
     Client-confirmed formula for bills that carry a PTS (Price To
-    Stockist, the `rate_pts` field) rate. Reasoning: taxable_value is the
-    billed amount, so dividing it back by the per-unit PTS rate recovers
-    how many units were actually BILLED ("original" quantity); whatever's
-    left out of the line's total quantity (see _resolve_line_item_quantity
-    -- not always the plain `quantity` field) is free/bonus stock that
-    wasn't billed.
+    Stockist, the `rate_pts` field) rate -- or, absent that, a Disc
+    Price/Rate/Unit Price/Unit Rate column instead (see
+    _resolve_pts_divisor). Reasoning: taxable_value is the billed amount,
+    so dividing it back by the per-unit rate recovers how many units were
+    actually BILLED ("original" quantity); whatever's left out of the
+    line's total quantity (see _resolve_line_item_quantity -- not always
+    the plain `quantity` field) is free/bonus stock that wasn't billed.
 
-        original = round(taxable_value / rate_pts)
+        original = round(taxable_value / divisor)
         free = total_quantity - original
 
     Confirmed example: quantity=320, taxable_value=20044.8, rate_pts=69.6
@@ -1295,21 +1541,22 @@ def _compute_pts_derived_quantities(item: InvoiceLineItem) -> tuple[float | None
     independently known): Sold=50, taxable_value=14811.50, rate_pts=296.23
     -> original=round(14811.50/296.23)=50, matching Sold exactly -- ptr
     (329.14) does NOT reconcile here (gives 45), which is why this uses
-    rate_pts specifically, not ptr.
+    rate_pts specifically, not ptr, when rate_pts is available.
 
     Only computed when a usable quantity (see _resolve_line_item_quantity)
-    /taxable_value/rate_pts are ALL present and rate_pts is non-zero
+    /taxable_value/divisor are ALL present and the divisor is non-zero
     (guards the division) -- these are "dynamic" columns, meant to stay
-    None on every line/invoice that doesn't actually carry a PTS rate, not
-    just default to 0. Deliberately does NOT clamp a negative `free`
-    (original > quantity, i.e. the numbers on this particular line don't
-    reconcile) to 0 -- surfacing that inconsistency as-is is more useful
-    than silently hiding it.
+    None on every line/invoice with nothing usable to divide by, not just
+    default to 0. Deliberately does NOT clamp a negative `free` (original
+    > quantity, i.e. the numbers on this particular line don't reconcile)
+    to 0 -- surfacing that inconsistency as-is is more useful than
+    silently hiding it.
     """
     quantity = _resolve_line_item_quantity(item)
-    if quantity is None or item.taxable_value is None or not item.rate_pts:
+    divisor = _resolve_pts_divisor(item)
+    if quantity is None or item.taxable_value is None or not divisor:
         return None, None
-    original = round(item.taxable_value / item.rate_pts)
+    original = round(item.taxable_value / divisor)
     free = quantity - original
     return float(original), float(free)
 
@@ -1356,6 +1603,42 @@ def _subtotal_row_snapshot(item_kwargs: dict) -> dict:
     }
 
 
+_MIN_INTERNAL_HEADER_MATCHED_COLUMNS = 3
+
+
+def _find_best_internal_header_row(rows: list[list[str | None]]) -> int | None:
+    """
+    Fallback header-row detection for when PyMuPDF's own table.header
+    heuristic doesn't land on a row that maps to a recognizable line-item
+    column set. Confirmed real case: a real invoice's table.header pointed
+    at the letterhead/address block occupying the table's own first
+    physical row, not the actual "Sr.No. / Material / ..." column-name
+    row several rows further down (that row was never even considered as
+    a header candidate by the caller before this existed) -- silently
+    losing every line item on the page as a result (the table gets marked
+    unusable for having no item_description-shaped column at all).
+
+    Scans every row for the one matching the most known column keywords,
+    requiring an item_description-shaped match plus a minimum column
+    count so a stray data row with one coincidental keyword hit isn't
+    mistaken for a header (mirrors spatial_text.detect_header_row's same
+    guard for the positional-fallback path). Returns the row index, or
+    None if nothing cleared the threshold.
+    """
+    best_idx: int | None = None
+    best_count = 0
+    for idx, row in enumerate(rows):
+        column_map = _map_table_header_columns(row)
+        if "item_description" not in column_map.values():
+            continue
+        if len(column_map) < _MIN_INTERNAL_HEADER_MATCHED_COLUMNS:
+            continue
+        if len(column_map) > best_count:
+            best_idx = idx
+            best_count = len(column_map)
+    return best_idx
+
+
 def _table_header_names(table) -> tuple[list[str | None], bool]:
     """
     Prefers PyMuPDF's own table.header.names/.external over assuming
@@ -1374,6 +1657,78 @@ def _table_header_names(table) -> tuple[list[str | None], bool]:
         return list(header.names), bool(header.external)
     except AttributeError:
         return None, False
+
+
+# Real invoice (Vishal Agencies, Hyderabad) confirmed case: a bare
+# "CGST"/"SGST"/"IGST" GROUP-label cell sits on the header row itself,
+# while its own "Rate"/"Amount" sub-labels sit on a SEPARATE physical row
+# immediately below (not stacked as an embedded newline within one cell,
+# which _map_combined_header_columns already handles -- this is two
+# distinct grid ROWS). A row is only treated as this kind of sub-header,
+# never a real data row, when its item_description-shaped column is blank
+# (a genuine line item always has a description) AND it contains at least
+# one of these disambiguating words as its own cell text somewhere.
+_HEADER_SUBROW_TOKENS = ("rate", "amount", "%", "mrp", "qty", "price")
+
+
+def _looks_like_ruled_table_header_subrow(
+    candidate_row: list[str | None], item_description_idx: int | None
+) -> bool:
+    if item_description_idx is None or item_description_idx >= len(candidate_row):
+        return False
+    desc_cell = candidate_row[item_description_idx]
+    if desc_cell and str(desc_cell).strip():
+        return False
+    return any(
+        cell and any(token in str(cell).strip().lower() for token in _HEADER_SUBROW_TOKENS)
+        for cell in candidate_row
+    )
+
+
+def _merge_ruled_table_header_subrow(
+    primary_row: list[str | None], sub_row: list[str | None]
+) -> list[str | None]:
+    """
+    Combines a two-physical-row ruled-table header (group-label row +
+    its own Rate/Amount sub-label row directly below) into one pseudo
+    header row, column-index aligned -- find_tables() already grids both
+    rows to the same column positions, unlike the positional/spatial
+    parser's merge_header_subrow (spatial_text.py), which has to pair
+    words by x-coordinate proximity instead since it has no grid at all.
+
+    Real bug this fixes: with the group-label row read alone, bare "CGST"
+    matched cgst_amount's own generic bare-substring keyword instead of
+    the dedicated cgst_rate field (no keyword of cgst_rate's own matches
+    unqualified "CGST") -- so the RATE value (e.g. "2.50") landed in
+    cgst_amount, and the real amount value (e.g. "697.69"), whose own
+    header cell is blank (merged into the group cell above it in the
+    ruled grid), was never mapped to anything at all and silently
+    dropped. Same shape of bug for SGST/IGST.
+
+    A merged/spanning header cell in a ruled table prints its text once
+    in the FIRST column of its span and None in the rest -- so the group
+    label is carried forward across a run of blank primary cells (e.g.
+    "CGST" at column 19 covering columns 19-21) until the next non-blank
+    primary cell starts a new group. A blank primary cell with no
+    sub-label either (a pure spacer/divider column) stays None --
+    carrying the group label into it with no sub-label to attach would
+    just create a duplicate, ambiguous column.
+    """
+    merged: list[str | None] = []
+    last_group: str | None = None
+    for idx, primary_raw in enumerate(primary_row):
+        primary_cell = primary_raw if primary_raw and str(primary_raw).strip() else None
+        sub_raw = sub_row[idx] if idx < len(sub_row) else None
+        sub_cell = sub_raw if sub_raw and str(sub_raw).strip() else None
+        if primary_cell is not None:
+            last_group = primary_cell
+        if sub_cell is not None:
+            merged.append(f"{last_group} {sub_cell}".strip() if last_group else sub_cell)
+        elif primary_cell is not None:
+            merged.append(primary_cell)
+        else:
+            merged.append(None)
+    return merged
 
 
 def _extract_line_items_from_tables(
@@ -1454,6 +1809,36 @@ def _extract_line_items_from_tables(
                 continue
 
             column_map = _map_table_header_columns(header_names)
+
+            if "item_description" not in column_map.values():
+                # PyMuPDF's own header guess (or the rows[0] fallback
+                # above) didn't land on a usable header row -- see
+                # _find_best_internal_header_row's docstring for the real
+                # case that motivated this: try scanning the table's own
+                # rows for the actual column-name row instead of giving up
+                # on this table entirely.
+                internal_header_idx = _find_best_internal_header_row(rows)
+                if internal_header_idx is not None:
+                    header_names = rows[internal_header_idx]
+                    header_external = False
+                    data_rows = rows[internal_header_idx + 1 :]
+                    column_map = _map_table_header_columns(header_names)
+
+            # See _merge_ruled_table_header_subrow's docstring: a two-
+            # PHYSICAL-ROW header (group-label row + its own Rate/Amount
+            # sub-label row immediately below) needs both rows read
+            # together to map correctly -- checked against whatever the
+            # first row of data_rows currently is, regardless of which
+            # branch above set header_names/data_rows.
+            if data_rows:
+                item_description_idx = next(
+                    (idx for idx, field_name in column_map.items() if field_name == "item_description"),
+                    None,
+                )
+                if _looks_like_ruled_table_header_subrow(data_rows[0], item_description_idx):
+                    header_names = _merge_ruled_table_header_subrow(header_names, data_rows[0])
+                    data_rows = data_rows[1:]
+                    column_map = _map_table_header_columns(header_names)
             candidates.append(
                 {
                     "table_index": table_index,
@@ -1508,6 +1893,19 @@ def _extract_line_items_from_tables(
             )
         page_diag["tables_used"] = 1
 
+        # See _map_combined_header_columns's module comment: a column whose
+        # HEADER cell is itself multi-line (e.g. "Mfg Date/\nExp Date") can
+        # hold two genuinely different stacked values per row, not one
+        # value wrapped across two lines -- excluded from the normal
+        # single-field column_map entirely so the collapse-to-one-string
+        # path below never touches it, and handled by its own loop instead.
+        combined_header_map = _map_combined_header_columns(selected["header_names"])
+        single_field_column_map = {
+            idx: field_name
+            for idx, field_name in selected["column_map"].items()
+            if idx not in combined_header_map
+        }
+
         for row in selected["data_rows"]:
             # Checked against the row's FULL text (every non-empty cell,
             # not just whatever landed in item_description) -- confirmed
@@ -1527,7 +1925,7 @@ def _extract_line_items_from_tables(
             }
             field_confidences: dict[str, ConfidenceBand] = {}
 
-            for idx, field_name in selected["column_map"].items():
+            for idx, field_name in single_field_column_map.items():
                 if field_name not in _INVOICE_LINE_ITEM_FIELD_NAMES:
                     continue
                 if idx >= len(row) or not row[idx]:
@@ -1544,6 +1942,31 @@ def _extract_line_items_from_tables(
                 else:
                     item_kwargs[field_name] = raw_value
                     field_confidences[field_name] = ConfidenceBand.REVIEW
+
+            for idx, (field0, field1) in combined_header_map.items():
+                if idx >= len(row) or not row[idx]:
+                    continue
+                # A row's OWN data cell for a combined column isn't
+                # guaranteed to have both lines populated (e.g. IGST is
+                # commonly "0.00" alone, with no rate line, when a
+                # transaction isn't inter-state) -- split on however many
+                # lines are actually there rather than assuming exactly 2.
+                cell_lines = [line.strip() for line in row[idx].split("\n") if line.strip()]
+                for field_name, cell_line in zip((field0, field1), cell_lines):
+                    if field_name is None or field_name not in _INVOICE_LINE_ITEM_FIELD_NAMES:
+                        continue
+                    raw_value = _normalize_cell_text(cell_line)
+                    if not raw_value:
+                        continue
+                    if field_name in _LINE_ITEM_NUMERIC_FIELDS:
+                        parsed = _parse_amount(raw_value)
+                        item_kwargs[field_name] = parsed
+                        field_confidences[field_name] = (
+                            ConfidenceBand.REVIEW if parsed is not None else ConfidenceBand.NOT_FOUND
+                        )
+                    else:
+                        item_kwargs[field_name] = raw_value
+                        field_confidences[field_name] = ConfidenceBand.REVIEW
 
             if is_subtotal:
                 # The subtotal label itself may not have landed in the
@@ -1806,6 +2229,7 @@ def _extract_line_items_positional(
             sample_rows=[],
             line_items_produced=0,
             subtotal_rows=[],
+            category_label_rows=[],
             stopped_reason=None,
             sub_header_merged=False,
         )
@@ -1859,6 +2283,52 @@ def _extract_line_items_positional(
                 fallback_matches, fallback_unmatched = match_row_columns(orphan_subs, remaining_keywords)
                 header_matches.update(fallback_matches)
                 header_unmatched = header_unmatched + fallback_unmatched
+
+            # merge_header_subrow's pairing is strictly 1-primary-to-1-sub
+            # (see its own docstring) -- so a GROUP label spanning TWO
+            # sub-labels, a tax column's own "Rate" AND "Amount"
+            # sub-columns (e.g. "CGST"/"SGST"/"IGST"), can only ever claim
+            # ONE of them. Confirmed against a real invoice (Indoco
+            # Remedies Ltd) where "Amount" won the pairing (closer by
+            # x-distance to the group label) and "Rate" was left a bare
+            # orphan with no group-label text of its own to match any
+            # _rate field's keywords (they all require the "cgst"/"sgst"/
+            # "igst" prefix, which the orphan "Rate" word alone doesn't
+            # have) -- cgst_rate/sgst_rate/igst_rate stayed blank even
+            # though the value was right there on the page. Recovered by
+            # pairing each still-unclaimed "Rate" orphan with whichever
+            # already-claimed *_amount compound sits closest to it by
+            # x-distance -- that compound's own coordinates mark exactly
+            # where its group label sits, so the orphan's bare text never
+            # needs to be combined with anything; the matched field name
+            # alone is enough.
+            for amount_field, rate_field in (
+                ("cgst_amount", "cgst_rate"),
+                ("sgst_amount", "sgst_rate"),
+                ("igst_amount", "igst_rate"),
+            ):
+                if rate_field in header_matches or amount_field not in header_matches:
+                    continue
+                rate_orphans = [w for w in orphan_subs if "rate" in w.text.strip().lower()]
+                if not rate_orphans:
+                    continue
+                amount_word = header_matches[amount_field]
+                nearest = min(rate_orphans, key=lambda w: abs(w.x_center - amount_word.x_center))
+                header_matches[rate_field] = nearest
+                orphan_subs = [w for w in orphan_subs if w is not nearest]
+                # Also drop it from header_unmatched -- the earlier
+                # keyword-based fallback pass already failed to match this
+                # SAME bare "Rate" word and appended it there as a generic
+                # boundary anchor. Left in place, it would sit in
+                # compute_column_boundaries's anchor list TWICE (once via
+                # header_matches, once via header_unmatched) at the exact
+                # same x-position, corrupting the midpoint-with-next-anchor
+                # math for this field's own right edge (confirmed: it
+                # collapsed to roughly the word's own center instead of the
+                # real midpoint with the next column, cutting the actual
+                # data value off just outside the resulting boundary).
+                header_unmatched = [w for w in header_unmatched if w is not nearest]
+
             data_start_idx += 1
             sub_header_merged = True
 
@@ -1949,10 +2419,17 @@ def _extract_line_items_positional(
                 break
             continue
 
-        if not any(field_name in _INVOICE_LINE_ITEM_FIELD_NAMES for field_name in non_empty_cells):
-            # Every word in this row landed in a recognized-but-not-a-real-
-            # field column (e.g. "manufacturer" -- see
-            # _INVOICE_LINE_ITEM_FIELD_NAMES) -- typically a wrapped
+        if not any(
+            field_name in _INVOICE_LINE_ITEM_FIELD_NAMES and field_name not in _ROW_CONTINUATION_PRONE_FIELDS
+            for field_name in non_empty_cells
+        ):
+            # Every word in this row landed in either a recognized-but-not-
+            # a-real-field column (e.g. "sr_no" -- see
+            # _INVOICE_LINE_ITEM_FIELD_NAMES), OR a real field that's
+            # nonetheless excluded from this "is this a genuine new item
+            # row" signal because it's known to commonly appear ALONE on a
+            # wrapped continuation line (manufacturer -- see
+            # _ROW_CONTINUATION_PRONE_FIELDS) -- typically a wrapped
             # continuation line of a multi-line cell (a manufacturer name
             # that wraps 2-3 lines is common on real invoices; confirmed
             # against a real document where this caused the table scan to
@@ -2007,6 +2484,23 @@ def _extract_line_items_positional(
                 break
             continue
         consecutive_unmatched_rows = 0
+
+        if item_kwargs["item_description"] and not any(
+            item_kwargs.get(field_name) is not None for field_name in _LINE_ITEM_NUMERIC_FIELDS
+        ):
+            # A bare group/category label row (confirmed real invoice --
+            # Indoco Remedies Ltd groups its products under brand-category
+            # headers like "PHARMA"/"SPADE"/"SPERA"/"NXGEN", each its own
+            # row with NO data of its own, not even quantity/MRP -- a
+            # "tree" of categories each containing line items, per the
+            # client's own description). Has a description (so
+            # has_usable_data passed) but genuinely no supporting numeric
+            # data at all, unlike every real product row. Not the end of
+            # the table (real items follow a category header), just not a
+            # line item itself -- skip it exactly like a subtotal row.
+            if diagnostics is not None:
+                diagnostics["category_label_rows"].append(_subtotal_row_snapshot(item_kwargs))
+            continue
 
         # Checked against the row's FULL text, not just whatever landed in
         # item_description -- confirmed necessary against a real invoice
@@ -2494,6 +2988,8 @@ def extract_invoice_group_fields(
     finally:
         doc.close()
 
+    line_items = _merge_page_split_description_only_rows(line_items)
+
     # Applied once, centrally, to every produced item regardless of which
     # extraction path (find_tables() or the positional fallback, on any
     # page) built it -- see _split_description_and_pack. Skipped for an
@@ -2504,9 +3000,27 @@ def extract_invoice_group_fields(
     # hyphen, silently discarding a correctly-split pack).
     for item in line_items:
         if item.pack is None:
+            item.item_description, item.pack = _split_description_and_pack_size_label(item.item_description)
+        if item.pack is None:
             item.item_description, item.pack = _split_description_and_pack(item.item_description)
         item.expiry_date = _normalize_short_date(item.expiry_date)
         item.mfg_date = _normalize_short_date(item.mfg_date)
         item.pts_original_quantity, item.pts_free_quantity = _compute_pts_derived_quantities(item)
+        # Backfill the RAW quantity_sold/quantity_free sub-columns from the
+        # PTS-derived pair above when the invoice's own table has no
+        # distinct "Sold"/"Free"-labeled column to read them from directly
+        # (confirmed on two different real invoice formats: one with only
+        # a plain "Qty." column, one with a "Qty."+"Free Qty." pair but no
+        # "Sold" wording at all) -- otherwise quantity_sold/quantity_free
+        # stay blank even though the PTS math already answers the same
+        # question. Deliberately uses the PTS-derived values rather than
+        # just copying `quantity` wholesale: a genuine partial-free line
+        # (e.g. quantity=320, PTS-derived original=288, free=32) would
+        # otherwise wrongly show Sold=320/Free=0. Left untouched whenever a
+        # real Sold/Free-labeled column already populated the raw field.
+        if item.quantity_sold is None and item.pts_original_quantity is not None:
+            item.quantity_sold = item.pts_original_quantity
+        if item.quantity_free is None and item.pts_free_quantity is not None:
+            item.quantity_free = item.pts_free_quantity
 
     return header_fields, header_field_confidences, line_items

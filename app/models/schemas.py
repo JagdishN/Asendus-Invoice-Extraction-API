@@ -69,8 +69,20 @@ class InvoiceLineItem(BaseModel):
     # native_pdf_extraction.py's _split_description_and_pack. Client-
     # confirmed: this is packaging info (tablet count, volume), not part
     # of the product name proper.
+    # Pack can ALSO come directly from a real "Pack" column (see
+    # native_pdf_extraction.py's _LINE_ITEM_COLUMN_KEYWORDS) -- when it
+    # does, the hyphen-split above is skipped (guarded by "pack is None")
+    # so it doesn't overwrite an already-correct, directly-extracted value.
     pack: Optional[str] = None
     hsn_sac: Optional[str] = None
+    # Manufacturer of this specific batch -- confirmed real invoice
+    # (Indoco Remedies Ltd) whose line items print a short manufacturer
+    # code ("MFRS" column, e.g. "WALU"/"SYNK"/"OSPP") separate from the
+    # product/brand name itself, explained by a legend elsewhere on the
+    # invoice (e.g. "WALU WALUJ PLANT"). Was previously recognized only
+    # to help the positional parser's table-end detection (a wrapped
+    # manufacturer name spanning multiple lines), never actually stored.
+    manufacturer: Optional[str] = None
     # Pharma-format fields (see native_pdf_extraction.py's pharma column
     # mapping). batch_number/expiry_date are regulatory-required for
     # pharma distribution, not present on the earlier generic invoice format.
@@ -90,19 +102,22 @@ class InvoiceLineItem(BaseModel):
     quantity_total: Optional[float] = None
     # Derived, NOT directly extracted from the invoice -- client-confirmed
     # formula: the billed ("original") quantity is recovered by dividing
-    # taxable_value back by rate_pts (PTS -- Price To Stockist, NOT ptr/
-    # Price To Retailer; verified against a real invoice whose printed
-    # Sold quantities only reconcile against rate_pts, not ptr), and
-    # whatever's left out of the line's total quantity is free/bonus
-    # stock. The "total quantity" here isn't always the plain `quantity`
-    # field -- a format that splits Sold/Free into their own sub-columns
-    # (quantity_sold/quantity_free above) instead of one bundled number
-    # still needs this computed, so it falls back through quantity ->
-    # quantity_total -> quantity_sold+quantity_free. See
-    # native_pdf_extraction.py's _compute_pts_derived_quantities/
-    # _resolve_line_item_quantity for the exact computation. "Dynamic"
-    # columns: only populated when a usable quantity, taxable_value, AND
-    # rate_pts are present on this line, None otherwise.
+    # taxable_value back by a per-unit rate, and whatever's left out of the
+    # line's total quantity is free/bonus stock. Prefers rate_pts (PTS --
+    # Price To Stockist, NOT ptr/Price To Retailer; verified against a real
+    # invoice whose printed Sold quantities only reconcile against
+    # rate_pts, not ptr) when present; client-confirmed fallback: when a
+    # bill has no PTS column at all, unit_rate (which already covers Disc
+    # Price/Rate/Unit Price/Unit Rate column namings generically) is used
+    # instead. See native_pdf_extraction.py's _compute_pts_derived_
+    # quantities/_resolve_pts_divisor for the divisor choice. The "total
+    # quantity" here isn't always the plain `quantity` field either -- a
+    # format that splits Sold/Free into their own sub-columns (quantity_
+    # sold/quantity_free above) instead of one bundled number still needs
+    # this computed, so it falls back through quantity -> quantity_total
+    # -> quantity_sold+quantity_free (see _resolve_line_item_quantity).
+    # "Dynamic" columns: only populated when a usable quantity, taxable_
+    # value, AND divisor are all present on this line, None otherwise.
     pts_original_quantity: Optional[float] = None
     pts_free_quantity: Optional[float] = None
     uom: Optional[str] = None

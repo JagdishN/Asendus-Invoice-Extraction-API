@@ -5,8 +5,11 @@ from app.services.native_pdf_extraction import (
     _compute_pts_derived_quantities,
     _extract_amount_field,
     _extract_invoice_number,
+    _map_table_header_columns,
+    _merge_page_split_description_only_rows,
     _normalize_short_date,
     _split_description_and_pack,
+    _split_description_and_pack_size_label,
     extract_invoice_group_fields,
     extract_page_invoice_numbers,
 )
@@ -46,6 +49,21 @@ def test_valid_irn_shaped_invoice_number_gets_high_confidence():
 
     assert results[0].invoice_number == SAMPLE_IRN
     assert results[0].confidence == ConfidenceBand.HIGH
+
+
+def test_short_plain_numeric_invoice_number_is_not_rejected():
+    # Regression check for a real bug: a real invoice's own plain numeric
+    # invoice number ("369377796", 9 digits) was shorter than the
+    # value-shape regex's old 10-character minimum, so the same-line
+    # label:value match failed outright -- not just graded lower
+    # confidence, but silently None -- and a coincidentally-10-character
+    # nearby value (a DATE) got picked up by the spatial fallback instead.
+    invoice = dict(SAMPLE_INVOICE, invoice_number="369377796")
+    pdf_bytes = build_invoice_pdf_bytes([invoice])
+    results = extract_page_invoice_numbers(pdf_bytes)
+
+    assert results[0].invoice_number == "369377796"
+    assert results[0].confidence == ConfidenceBand.REVIEW
 
 
 def test_blank_page_has_no_text_layer_and_no_invoice_number():
@@ -228,14 +246,14 @@ def test_normalize_short_date_numeric_day_month_year():
     assert _normalize_short_date("5.3.2028") == "05-Mar-2028"
 
 
-def test_normalize_short_date_numeric_month_year_only_has_no_day():
-    assert _normalize_short_date("12/2027") == "Dec-2027"
-    assert _normalize_short_date("03-28") == "Mar-2028"  # 2-digit year assumed 20xx
+def test_normalize_short_date_numeric_month_year_defaults_day_to_01():
+    assert _normalize_short_date("12/2027") == "01-Dec-2027"
+    assert _normalize_short_date("03-28") == "01-Mar-2028"  # 2-digit year assumed 20xx
 
 
-def test_normalize_short_date_month_name_year_only_has_no_day():
-    assert _normalize_short_date("MAR-2028") == "Mar-2028"
-    assert _normalize_short_date("Apr/2026") == "Apr-2026"
+def test_normalize_short_date_month_name_year_defaults_day_to_01():
+    assert _normalize_short_date("MAR-2028") == "01-Mar-2028"
+    assert _normalize_short_date("Apr/2026") == "01-Apr-2026"
 
 
 def test_normalize_short_date_day_month_name_year():
@@ -258,8 +276,8 @@ def test_expiry_and_mfg_date_normalized_end_to_end_on_batch_detail_row_format():
 
     pdf_bytes = build_batch_detail_row_invoice_pdf_bytes()
     _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
-    assert line_items[0].expiry_date == "Mar-2028"
-    assert line_items[0].mfg_date == "Apr-2026"
+    assert line_items[0].expiry_date == "01-Mar-2028"
+    assert line_items[0].mfg_date == "01-Apr-2026"
 
 
 # ---------------------------------------------------------------------------
@@ -364,3 +382,140 @@ def test_pts_derived_quantities_computed_end_to_end_for_sold_free_split_format()
     assert line_items[0].rate_pts == 296.23
     assert line_items[0].pts_original_quantity == 50.0
     assert line_items[0].pts_free_quantity == 0.0
+
+
+def test_pts_derived_quantities_falls_back_to_unit_rate_when_no_pts_column():
+    # Client-confirmed fallback: a bill with no PTS column at all can use
+    # any Disc Price/Rate/Unit Price/Unit Rate column instead (all
+    # captured under the generic unit_rate field already).
+    item = _line_item(quantity=100.0, taxable_value=5000.0, unit_rate=50.0)
+    original, free = _compute_pts_derived_quantities(item)
+    assert original == 100.0
+    assert free == 0.0
+
+
+def test_pts_derived_quantities_prefers_rate_pts_over_unit_rate_when_both_present():
+    item = _line_item(quantity=320.0, taxable_value=20044.8, rate_pts=69.6, unit_rate=999.0)
+    original, free = _compute_pts_derived_quantities(item)
+    assert original == 288.0  # uses rate_pts (69.6), not unit_rate (999.0)
+    assert free == 32.0
+
+
+# ---------------------------------------------------------------------------
+# "Pack Size:" label embedded in the description cell itself (client-
+# confirmed real invoice: Vishal Agencies, Hyderabad -- e.g. "CUDO FORTE\n
+# Pack Size: 1*10 CAPSULE" as ONE cell, collapsed to "CUDO FORTE Pack
+# Size: 1*10 CAPSULE" before this runs).
+# ---------------------------------------------------------------------------
+
+
+def test_split_description_and_pack_size_label_examples():
+    assert _split_description_and_pack_size_label("CUDO FORTE Pack Size: 1*10 CAPSULE") == (
+        "CUDO FORTE", "1*10 CAPSULE",
+    )
+    assert _split_description_and_pack_size_label("EIDO INJ. Pack Size: 1 AMP") == ("EIDO INJ.", "1 AMP")
+
+
+def test_split_description_and_pack_size_label_no_label_leaves_description_unchanged():
+    assert _split_description_and_pack_size_label("Plain Product Name") == ("Plain Product Name", None)
+
+
+def test_pack_size_label_split_end_to_end_via_extract_invoice_group_fields():
+    # Exercises the split function's own wiring into extract_invoice_
+    # group_fields's post-processing loop (the pharma test builder's own
+    # description column is a single-line cell, so this feeds it the
+    # already-collapsed shape a real multi-line PDF cell would produce).
+    # Kept short to fit this builder's fixed description column width
+    # (a longer string overflows into the neighboring column and gets
+    # truncated -- a test-fixture rendering artifact, not a real bug; see
+    # the pure _split_description_and_pack_size_label tests above and the
+    # real-invoice cross-check for full-length verification).
+    line_item = dict(
+        sr=1, description="CUDO Pack Size: 1x10", hsn="21069099", batch="DN126287",
+        expiry="02/2028", sold=21, free="", total_qty=21, mrp="1938.04", ptr="1476.60", rate_pts="1328.94",
+        total_amt="27907.74", discount="", taxable="27907.74",
+        cgst_rate="2.50%", cgst_amt="697.69", sgst_rate="2.50%", sgst_amt="697.69",
+        igst_rate="", igst_amt="",
+    )
+    pdf_bytes = build_pharma_invoice_pdf_bytes(line_items=[line_item])
+    _, _, line_items = extract_invoice_group_fields(pdf_bytes, [1])
+
+    assert line_items[0].item_description == "CUDO"
+    assert line_items[0].pack == "1x10"
+
+
+def test_mfg_name_header_recognized_as_manufacturer():
+    # Confirmed real invoice (Vishal Agencies, Hyderabad) spells this
+    # column out fully as "Mfg Name" rather than abbreviating.
+    mapping = _map_table_header_columns(["Description of Goods", "Mfg Name", "Expiry Date"])
+    assert mapping[1] == "manufacturer"
+
+
+# ---------------------------------------------------------------------------
+# Cross-page product-name split (confirmed real invoice: Vishal Agencies,
+# Hyderabad, a 7-page invoice where one product's name landed as the very
+# last row of a page with nothing else on it, and the rest of that same
+# row's data printed as the first row of the next page with no name at
+# all -- each page parsed independently, so this produced two broken line
+# items instead of one correct one).
+# ---------------------------------------------------------------------------
+
+
+def test_merge_page_split_description_only_row_into_following_real_row():
+    orphan = _line_item(line_number=1, item_description="EMPASHIELD-10")
+    real = _line_item(
+        line_number=2, item_description="Pack Size: 1*10 TABLET", batch_number="EMV260394A",
+        taxable_value=636.40, quantity=10.0,
+    )
+    merged = _merge_page_split_description_only_rows([orphan, real])
+
+    assert len(merged) == 1
+    assert merged[0].item_description == "EMPASHIELD-10 Pack Size: 1*10 TABLET"
+    assert merged[0].batch_number == "EMV260394A"
+    assert merged[0].taxable_value == 636.40
+    assert merged[0].line_number == 1
+
+
+def test_merge_leaves_two_genuine_consecutive_items_untouched():
+    first = _line_item(line_number=1, item_description="Item A", taxable_value=100.0, quantity=1.0)
+    second = _line_item(line_number=2, item_description="Item B", taxable_value=200.0, quantity=2.0)
+    merged = _merge_page_split_description_only_rows([first, second])
+
+    assert len(merged) == 2
+    assert [item.item_description for item in merged] == ["Item A", "Item B"]
+
+
+def test_merge_does_not_touch_a_description_only_row_with_no_following_real_row():
+    # A genuinely blank/sparse trailing row (not a page-split artifact)
+    # must be left alone rather than merged into nothing.
+    orphan = _line_item(line_number=1, item_description="Some Label")
+    merged = _merge_page_split_description_only_rows([orphan])
+
+    assert len(merged) == 1
+    assert merged[0].item_description == "Some Label"
+
+
+def test_page_split_product_name_merged_end_to_end_on_real_invoice_shape():
+    # Mirrors the real 7-page invoice's exact scenario via extract_
+    # invoice_group_fields's own merge step, using hand-built line items
+    # (find_tables()/positional per-page parsing is what actually produces
+    # this split in production -- see _merge_page_split_description_only_rows'
+    # own docstring for the real page-break mechanism).
+    from app.services.native_pdf_extraction import _merge_page_split_description_only_rows as merge_fn
+
+    orphan = _line_item(line_number=74, item_description="EMPASHIELD-10", source_page=5)
+    real = _line_item(
+        line_number=75, item_description="Pack Size: 1*10 TABLET", source_page=6,
+        batch_number="EMV260394A", taxable_value=636.40, quantity=10.0,
+    )
+    following = _line_item(
+        line_number=76, item_description="EMPASHIELD-S 25/100", source_page=6,
+        taxable_value=3837.90, quantity=30.0,
+    )
+    merged = merge_fn([orphan, real, following])
+
+    assert len(merged) == 2
+    assert merged[0].item_description == "EMPASHIELD-10 Pack Size: 1*10 TABLET"
+    assert merged[0].line_number == 1
+    assert merged[1].item_description == "EMPASHIELD-S 25/100"
+    assert merged[1].line_number == 2

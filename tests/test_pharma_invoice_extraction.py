@@ -125,8 +125,9 @@ def test_sold_and_free_quantities_stay_as_separate_line_items_not_merged():
     sold_row, free_row = line_items[0], line_items[1]
     assert sold_row.item_description == free_row.item_description == "Paracetamol 500mg Tab"
     assert sold_row.batch_number == free_row.batch_number == "B2201"
-    # Raw "12/2027" (month/year, no day) normalizes to short-date "Dec-2027".
-    assert sold_row.expiry_date == free_row.expiry_date == "Dec-2027"
+    # Raw "12/2027" (month/year, no day) normalizes to short-date
+    # "01-Dec-2027" -- day defaults to 01 when the source has none.
+    assert sold_row.expiry_date == free_row.expiry_date == "01-Dec-2027"
 
     assert sold_row.quantity_sold == 100.0
     assert sold_row.quantity_free is None

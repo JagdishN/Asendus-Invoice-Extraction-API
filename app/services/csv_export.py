@@ -45,6 +45,7 @@ _LINE_ITEM_COLUMN_LABELS = {
     "item_description": "Item Description",
     "pack": "Pack",
     "hsn_sac": "HSN/SAC",
+    "manufacturer": "Manufacturer",
     "batch_number": "Batch Number",
     "expiry_date": "Expiry Date",
     "mfg_date": "Mfg Date",

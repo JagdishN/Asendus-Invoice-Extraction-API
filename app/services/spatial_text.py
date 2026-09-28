@@ -572,7 +572,21 @@ def compute_column_boundaries(matches: dict[str, Word], unmatched_words: list[Wo
         anchor_idx = all_anchors.index(word)
         prev_anchor = all_anchors[anchor_idx - 1] if anchor_idx > 0 else None
         next_anchor = all_anchors[anchor_idx + 1] if anchor_idx + 1 < len(all_anchors) else None
-        left = float("-inf") if prev_anchor is None else (prev_anchor.x1 + word.x0) / 2
+        # item_description ALWAYS gets an open (-inf) left edge, even when
+        # an unmatched anchor precedes it (e.g. a "Sr No"/"Case No" column)
+        # -- confirmed real invoice (Indoco Remedies Ltd) whose product-
+        # name text starts further LEFT than its own "PRODUCT" header word
+        # (the preceding "CASE NO" column is always blank in the real
+        # data), so the normal midpoint-with-the-previous-anchor boundary
+        # cut the first word off every single item ("CITAL SUGAR FREE
+        # 100ML" -> "SUGAR FREE 100ML"). A stray short case/serial number
+        # occasionally leaking into item_description instead is a far
+        # smaller, more reviewable problem than silently truncating real
+        # product names on every row.
+        if field_name == "item_description":
+            left = float("-inf")
+        else:
+            left = float("-inf") if prev_anchor is None else (prev_anchor.x1 + word.x0) / 2
         right = float("inf") if next_anchor is None else (word.x1 + next_anchor.x0) / 2
         boundaries.append(ColumnBoundary(field_name=field_name, left=left, right=right, header_text=word.text))
     return boundaries

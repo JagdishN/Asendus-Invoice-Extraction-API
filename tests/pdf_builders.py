@@ -768,3 +768,263 @@ def build_batch_detail_row_invoice_pdf_bytes(
     c.showPage()
     c.save()
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Reproduces the confirmed real "stacked-cell column" invoice layout
+# (Mankind Pharma Ltd's "Discovery"/"Nobelis" templates, see
+# native_pdf_extraction.py's _map_combined_header_columns/
+# _find_best_internal_header_row): several ruled-table columns hold TWO
+# distinct values stacked in one grid cell via an embedded newline (e.g.
+# the "Mfg Date/Exp Date" column's every data cell is literally
+# "<mfg date>\n<exp date>"), and the table's own header row sits a few
+# physical rows down from a preceding letterhead-style block -- both
+# confirmed real quirks, reproduced here deliberately (not just the clean
+# single-header-row case _draw_table_with_widths covers) so the internal-
+# header-row-scanning fallback gets exercised too, not just the combined-
+# cell splitting.
+# ---------------------------------------------------------------------------
+
+_STACKED_CELL_COLUMNS = [
+    (25, "Sr.No."),
+    (55, "Material\nHSN Code"),
+    (90, "Material Description"),
+    (35, "Pack"),
+    (80, "Mfg Name/\nBatch"),
+    (45, "Mfg Date/\nExp Date"),
+    (35, "MRP"),
+    (35, "P.T.R"),
+    (35, "P.T.S"),
+    (25, "QTY"),
+    (40, "Amount"),
+    (40, "Disc.Amt/\nDisc.%"),
+    (40, "Amount/\nCGST%"),
+    (40, "Amount/\nSGST%"),
+    (40, "Net Amount"),
+]
+
+_DEFAULT_STACKED_CELL_LINE_ITEMS = [
+    {
+        "sr": "1", "material": "50005589", "hsn": "30049099", "description": "DYNADUO-10 TABLETS",
+        "pack": "10 TABS", "mfg_name": "MANKIND PHARMA LTD.", "batch": "GB2Y003",
+        "mfg_date": "FEB-25", "expiry": "JAN-27", "mrp": "79.90", "ptr": "57.07", "pts": "51.36",
+        "qty": "24", "amount": "1232.64", "disc_amt": "0", "disc_pct": "0.00",
+        "cgst_amt": "73.96", "cgst_pct": "6.00", "sgst_amt": "73.96", "sgst_pct": "6.00",
+        "net_amount": "1380.56",
+    },
+    {
+        "sr": "2", "material": "50005590", "hsn": "30049099", "description": "DYNADUO-25 TABELTS",
+        "pack": "10 TABS", "mfg_name": "MANKIND PHARMA LTD.", "batch": "GC2Y002",
+        "mfg_date": "FEB-25", "expiry": "JAN-27", "mrp": "119.90", "ptr": "85.64", "pts": "77.08",
+        "qty": "21", "amount": "1618.68", "disc_amt": "0", "disc_pct": "0.00",
+        "cgst_amt": "97.12", "cgst_pct": "6.00", "sgst_amt": "97.12", "sgst_pct": "6.00",
+        "net_amount": "1812.92",
+    },
+]
+
+
+def build_stacked_cell_columns_invoice_pdf_bytes(
+    *, line_items: list[dict] | None = None
+) -> bytes:
+    items = line_items if line_items is not None else _DEFAULT_STACKED_CELL_LINE_ITEMS
+
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=landscape(A4))
+    _width, height = landscape(A4)
+    left_x = 20
+    y = height - 30
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(left_x, y, "TAX INVOICE (Discovery)")
+    y -= 20
+
+    # A preceding letterhead-style block (own row, well above the real
+    # column-header row) -- confirmed real quirk that makes PyMuPDF's own
+    # table.header heuristic mis-identify THIS block as the header instead
+    # of the real "Sr.No./Material/..." row further down, dropping every
+    # line item on the page unless the internal-header-row-scanning
+    # fallback finds the real one.
+    c.setFont("Helvetica", 8)
+    c.drawString(left_x, y, "MANKIND PHARMA LTD, PLOT NO A6/6, IDA NACHARAM, HYDERABAD 500076")
+    y -= 12
+    c.drawString(left_x, y, "Bill to Address: JYOTI MEDICAL HALL, SECUNDERABAD 500003")
+    y -= 12
+    c.drawString(left_x, y, "Invoice No : 369377796   Inv. Date : 12.03.2025")
+    y -= 40
+
+    rows = [
+        (
+            item["sr"],
+            f"{item['material']}\n{item['hsn']}",
+            item["description"],
+            item["pack"],
+            f"{item['mfg_name']}\n{item['batch']}",
+            f"{item['mfg_date']}\n{item['expiry']}",
+            item["mrp"],
+            item["ptr"],
+            item["pts"],
+            item["qty"],
+            item["amount"],
+            f"{item['disc_amt']}\n{item['disc_pct']}",
+            f"{item['cgst_amt']}\n{item['cgst_pct']}",
+            f"{item['sgst_amt']}\n{item['sgst_pct']}",
+            item["net_amount"],
+        )
+        for item in items
+    ]
+
+    col_widths = [w for w, _ in _STACKED_CELL_COLUMNS]
+    col_labels = [label for _, label in _STACKED_CELL_COLUMNS]
+    # Header row is drawn as a multi-line cell (matching how a genuinely
+    # multi-line ruled-table header renders), same as data rows below --
+    # both need enough vertical room for up to 3 stacked lines.
+    header_line_counts = [label.count("\n") + 1 for label in col_labels]
+    header_height = 10 * max(header_line_counts)
+    row_height = 22  # enough for a 2-line data cell
+
+    col_x = [left_x]
+    for w in col_widths:
+        col_x.append(col_x[-1] + w)
+    right_x = col_x[-1]
+
+    top_y = y
+    boundaries = [top_y]
+    for _rh, _cells in [(header_height, None)] + [(row_height, r) for r in rows]:
+        boundaries.append(boundaries[-1] - _rh)
+    bottom_y = boundaries[-1]
+
+    for yy in boundaries:
+        c.line(left_x, yy, right_x, yy)
+    for x in col_x:
+        c.line(x, top_y, x, bottom_y)
+
+    c.setFont("Helvetica-Bold", 6)
+    for x, label in zip(col_x, col_labels):
+        for line_idx, line in enumerate(label.split("\n")):
+            c.drawString(x + 2, boundaries[0] - 8 - line_idx * 9, line)
+
+    c.setFont("Helvetica", 6)
+    for row_idx, row in enumerate(rows, start=1):
+        row_top = boundaries[row_idx]
+        for x, val in zip(col_x, row):
+            for line_idx, line in enumerate(val.split("\n")):
+                c.drawString(x + 2, row_top - 8 - line_idx * 9, line)
+
+    c.showPage()
+    c.save()
+    return buffer.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Reproduces the confirmed real "category-grouped, whitespace-aligned"
+# invoice layout (Indoco Remedies Ltd) -- see native_pdf_extraction.py's
+# category-label-row skip and compute_column_boundaries' item_description
+# open-left-boundary fix:
+#   - No ruled table lines at all (find_tables() finds nothing) -- column
+#     boundaries are inferred purely from header/data word X-positions.
+#   - Product name text starts visually LEFT of the "PRODUCT" header word
+#     itself, under where a "CASE NO" column sits (always blank in the
+#     real data) -- confirmed real bug: this cut the first word off every
+#     single item's description.
+#   - Products are grouped under bare brand-category label rows ("PHARMA",
+#     "SPADE") with no data of their own at all -- a "tree" of categories
+#     each containing line items, per the client's own description.
+#   - A manufacturer-plant-code legend line ("Manufacturing Address:...")
+#     follows the real table -- confirmed real bug: this and its own
+#     multi-clause legend text got emitted as several fake trailing items.
+# ---------------------------------------------------------------------------
+
+
+def build_category_grouped_pharma_invoice_pdf_bytes() -> bytes:
+    buffer = BytesIO()
+    c = canvas.Canvas(buffer, pagesize=A4)
+    _width, height = A4
+    left_x = 20
+    y = height - 40
+
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(left_x, y, "TAX INVOICE CUM DELIVERY")
+    y -= 30
+
+    c.setFont("Helvetica-Bold", 7)
+    # Matches the real invoice's own header word X-offsets closely enough
+    # to reproduce the same relative gaps (CASE/NO sit well left of where
+    # PRODUCT starts, PRODUCT's own column is comfortably left of HSN/SAC).
+    c.drawString(left_x, y, "CASE NO")
+    c.drawString(left_x + 55, y, "PRODUCT")
+    c.drawString(left_x + 130, y, "HSN/SAC")
+    c.drawString(left_x + 175, y, "PACK")
+    c.drawString(left_x + 210, y, "MFRS")
+    c.drawString(left_x + 245, y, "EXP DATE")
+    c.drawString(left_x + 290, y, "BATCH NO")
+    c.drawString(left_x + 340, y, "QTY")
+    c.drawString(left_x + 375, y, "M.R.P.")
+    c.drawString(left_x + 410, y, "P.T.R.")
+    c.drawString(left_x + 445, y, "P.T.S.")
+    c.drawString(left_x + 480, y, "TAXABLE VALUE")
+    y -= 14
+
+    c.setFont("Helvetica", 7)
+
+    def draw_category(label: str) -> None:
+        nonlocal y
+        c.drawString(left_x, y, label)
+        y -= 12
+
+    def draw_item(
+        description: str, hsn: str, expiry: str, batch: str, qty: str, mrp: str, ptr: str, pts: str, taxable: str,
+        pack: str = "", mfrs: str = "",
+    ) -> None:
+        nonlocal y
+        # Product name starts a few points LEFT of the "PRODUCT" header's
+        # own X position (left_x + 55) -- the confirmed real quirk that
+        # truncated every item's first word before the boundary fix.
+        c.drawString(left_x + 8, y, description)
+        c.drawString(left_x + 130, y, hsn)
+        if pack:
+            c.drawString(left_x + 175, y, pack)
+        if mfrs:
+            c.drawString(left_x + 210, y, mfrs)
+        c.drawString(left_x + 245, y, expiry)
+        c.drawString(left_x + 290, y, batch)
+        c.drawString(left_x + 340, y, qty)
+        c.drawString(left_x + 375, y, mrp)
+        c.drawString(left_x + 410, y, ptr)
+        c.drawString(left_x + 445, y, pts)
+        c.drawString(left_x + 480, y, taxable)
+        y -= 12
+
+    draw_category("PHARMA")
+    draw_item(
+        "CITAL SUGAR FREE 100ML", "30044090", "Jun-29", "26050582", "160", "131.00", "99.81", "89.83", "12936.00",
+        pack="100 ML",
+    )
+    draw_item("CLOBEN G CREAM 15G", "30042019", "Jul-28", "26050616", "30", "130.00", "99.05", "89.14", "2228.40", pack="15 GMS")
+    draw_category("SPADE")
+    draw_item(
+        "CYCLOPAM TAB 15X3X10S", "30049039", "Jun-28", "26070302", "405", "62.50", "47.62", "42.86", "15430.50",
+        pack="10S", mfrs="WALU",
+    )
+    # A wrapped continuation line of the manufacturer cell above -- a real
+    # manufacturer name spanning 2-3 physical rows is common, and the
+    # continuation row carries no description/qty/mrp/etc. of its own.
+    # Must not become a fake extra line item, and must not stop the scan.
+    c.drawString(left_x + 210, y, "LIMITED")
+    y -= 12
+    draw_item(
+        "OTOREX EAR DROPS 10ML", "30049099", "May-28", "26070243", "100", "169.50", "129.14", "116.23", "10461.00",
+        pack="10 ML", mfrs="WALU",
+    )
+
+    y -= 10
+    c.setFont("Helvetica", 7)
+    c.drawString(
+        left_x, y,
+        "Manufacturing Address: STPL SOFTESULE PRIVATE LIMITED ; SHIV SHIVA BIOGENETIC ; WALU WALUJ PLANT ;",
+    )
+    y -= 12
+    c.drawString(left_x, y, "Time: 11:01:01 REGD OFFICE: INDOCO HOUSE, 166 CST ROAD, SANTACRUZ(E), MUMBAI-400098")
+
+    c.showPage()
+    c.save()
+    return buffer.getvalue()
