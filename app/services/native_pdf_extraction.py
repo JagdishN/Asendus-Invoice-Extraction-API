@@ -1383,23 +1383,19 @@ def _merge_page_split_description_only_rows(line_items: list[InvoiceLineItem]) -
 
 
 # --- Line-item date normalization (expiry_date/mfg_date) -----------------
-# Client-confirmed: these must display in the short "DD-MMM-YYYY" form
-# (e.g. "01-Sep-2026") in the exported table, ALWAYS including a day.
+# Client-confirmed: these must display in the numeric "DD-MM-YYYY" form
+# (e.g. "01-09-2026") in the exported table, ALWAYS including a day.
 # Pharma invoices routinely print expiry/mfg as a whole MONTH only, with
 # no day at all (confirmed real raw shapes across formats already in this
 # codebase: generic find_tables()-based columns print e.g. "12/2027"; the
 # batch-detail-row format's own regex captures e.g. "MAR-2028") -- when
 # there's no day in the source, the day defaults to "01" (client-
 # confirmed) rather than leaving it out, so every value in this column is
-# a consistent DD-MMM-YYYY shape.
+# a consistent DD-MM-YYYY shape.
 # Applied as ONE shared post-processing pass (see the pack-split loop at
 # the end of extract_invoice_group_fields, same pattern) so every
 # extraction path gets identical formatting instead of each one needing
 # its own date-formatting logic.
-_MONTH_ABBREVIATIONS = {
-    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun",
-    7: "Jul", 8: "Aug", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
-}
 _MONTH_NAME_TO_NUMBER = {
     "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
     "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
@@ -1410,11 +1406,14 @@ _MONTH_NAME_TO_NUMBER = {
 # Checked in this order: more specific (day present) patterns before their
 # day-less counterparts, so e.g. "01-MAR-2028" isn't left partially matched
 # by the day-less "MMM-YYYY" pattern (which now defaults the day to "01"
-# on a match, same as an explicit "01" would produce).
+# on a match, same as an explicit "01" would produce). Separator class
+# includes "." (not just "/"/"-") -- confirmed real invoice (Vishal
+# Agencies, Hyderabad) prints both "12.SEP.2026" (day+monthname+year) and
+# bare "FEB.2028" (monthname+year, no day) with period separators.
 _DATE_DAY_MONTH_YEAR_NUMERIC_RE = re.compile(r"^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})$")
-_DATE_DAY_MONTHNAME_YEAR_RE = re.compile(r"^(\d{1,2})[\s\/\-]([A-Za-z]{3,9})[\s\/\-,]+(\d{2,4})$")
+_DATE_DAY_MONTHNAME_YEAR_RE = re.compile(r"^(\d{1,2})[\s\/\-.]([A-Za-z]{3,9})[\s\/\-.,]+(\d{2,4})$")
 _DATE_MONTHNAME_DAY_YEAR_RE = re.compile(r"^([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{2,4})$")
-_DATE_MONTHNAME_YEAR_RE = re.compile(r"^([A-Za-z]{3,9})[\s\/\-](\d{2,4})$")
+_DATE_MONTHNAME_YEAR_RE = re.compile(r"^([A-Za-z]{3,9})[\s\/\-.](\d{2,4})$")
 _DATE_MONTH_YEAR_NUMERIC_RE = re.compile(r"^(\d{1,2})[\/\-.](\d{2,4})$")
 
 
@@ -1428,7 +1427,7 @@ def _normalize_date_year(raw_year: str) -> int:
 
 def _normalize_short_date(raw: str | None) -> str | None:
     """
-    Best-effort normalization to "DD-MMM-YYYY", ALWAYS including a day --
+    Best-effort normalization to "DD-MM-YYYY", ALWAYS including a day --
     client-confirmed: when the source has no day at all (see module
     comment above), it defaults to "01" rather than being left out.
     Recognizes the actual raw shapes seen across this codebase's invoice
@@ -1449,7 +1448,7 @@ def _normalize_short_date(raw: str | None) -> str | None:
     if match:
         day, month, year = int(match.group(1)), int(match.group(2)), _normalize_date_year(match.group(3))
         if 1 <= day <= 31 and 1 <= month <= 12:
-            return f"{day:02d}-{_MONTH_ABBREVIATIONS[month]}-{year:04d}"
+            return f"{day:02d}-{month:02d}-{year:04d}"
 
     match = _DATE_DAY_MONTHNAME_YEAR_RE.match(value)
     if match:
@@ -1457,7 +1456,7 @@ def _normalize_short_date(raw: str | None) -> str | None:
         if month:
             day, year = int(match.group(1)), _normalize_date_year(match.group(3))
             if 1 <= day <= 31:
-                return f"{day:02d}-{_MONTH_ABBREVIATIONS[month]}-{year:04d}"
+                return f"{day:02d}-{month:02d}-{year:04d}"
 
     match = _DATE_MONTHNAME_DAY_YEAR_RE.match(value)
     if match:
@@ -1465,19 +1464,19 @@ def _normalize_short_date(raw: str | None) -> str | None:
         if month:
             day, year = int(match.group(2)), _normalize_date_year(match.group(3))
             if 1 <= day <= 31:
-                return f"{day:02d}-{_MONTH_ABBREVIATIONS[month]}-{year:04d}"
+                return f"{day:02d}-{month:02d}-{year:04d}"
 
     match = _DATE_MONTHNAME_YEAR_RE.match(value)
     if match:
         month = _MONTH_NAME_TO_NUMBER.get(match.group(1).lower())
         if month:
-            return f"01-{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
+            return f"01-{month:02d}-{_normalize_date_year(match.group(2)):04d}"
 
     match = _DATE_MONTH_YEAR_NUMERIC_RE.match(value)
     if match:
         month = int(match.group(1))
         if 1 <= month <= 12:
-            return f"01-{_MONTH_ABBREVIATIONS[month]}-{_normalize_date_year(match.group(2)):04d}"
+            return f"01-{month:02d}-{_normalize_date_year(match.group(2)):04d}"
 
     return raw
 

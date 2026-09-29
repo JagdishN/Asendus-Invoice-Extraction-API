@@ -88,8 +88,8 @@ def test_stacked_cell_columns_extracted_correctly_end_to_end():
     assert first.hsn_sac == "30049099"
     assert first.batch_number == "GB2Y003"
     # Raw "FEB-25"/"JAN-27" normalize to short-date with day defaulted to 01.
-    assert first.mfg_date == "01-Feb-2025"
-    assert first.expiry_date == "01-Jan-2027"
+    assert first.mfg_date == "01-02-2025"
+    assert first.expiry_date == "01-01-2027"
     assert first.mrp == 79.90
     assert first.ptr == 57.07  # "P.T.R" (with periods) must still match
     assert first.rate_pts == 51.36  # "P.T.S" (with periods) must still match
@@ -110,8 +110,8 @@ def test_stacked_cell_columns_extracted_correctly_end_to_end():
     assert second.item_description == "DYNADUO-25 TABELTS"
     assert second.hsn_sac == "30049099"
     assert second.batch_number == "GC2Y002"
-    assert second.mfg_date == "01-Feb-2025"
-    assert second.expiry_date == "01-Jan-2027"
+    assert second.mfg_date == "01-02-2025"
+    assert second.expiry_date == "01-01-2027"
 
 
 def test_stacked_cell_columns_do_not_leak_into_each_other():

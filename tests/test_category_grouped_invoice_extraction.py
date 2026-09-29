@@ -64,7 +64,7 @@ def test_bare_product_and_perioded_mrp_headers_are_recognized():
     first = next(item for item in line_items if item.item_description == "CITAL SUGAR FREE 100ML")
     assert first.mrp == 131.00
     assert first.hsn_sac == "30044090"
-    assert first.expiry_date == "01-Jun-2029"
+    assert first.expiry_date == "01-06-2029"
     assert first.batch_number == "26050582"
     assert first.quantity == 160.0
     assert first.ptr == 99.81
